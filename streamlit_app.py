@@ -3,6 +3,8 @@ import pandas as pd
 import numpy as np
 import joblib
 import requests
+from googlesearch import search
+from bs4 import BeautifulSoup
 
 # ==========================================================
 # STREAMLIT APP — 2022–2024 ONLY
@@ -403,41 +405,88 @@ else:
        
 
 # ==================================================
-# F1 CHATBOT (MODEL-ONLY, PROMPT-BASED)
+# F1 CHATBOT (OFFICIAL F1 RESULTS + OLLAMA FALLBACK)
 # ==================================================
 import streamlit as st
 import requests
+from bs4 import BeautifulSoup
 
 # -----------------------------
-# Helper: query LLM (Ollama, prompt-based)
+# CONFIG (MULTI-MODEL)
 # -----------------------------
-def ask_ollama(prompt, model="llama3"):
-    """
-    Sends a prompt to the local Ollama API and returns the response.
-    Works with older API versions that expect 'prompt' instead of 'messages'.
-    """
+OLLAMA_MODELS = ["llama3:latest", "gpt-oss:20b"]
+
+# -----------------------------
+# Helper: query LLM (Ollama)
+# -----------------------------
+def ask_ollama(prompt, model="llama3:latest"):
     try:
         response = requests.post(
             "http://localhost:11434/api/generate",
             json={
                 "model": model,
                 "prompt": prompt,
-                "temperature": 0.0,  # deterministic factual answers
+                "temperature": 0.2,
                 "stream": False
-            }
+            },
+            timeout=60
         )
-        # Most local Ollama versions return {"response": "..."}
-        return response.json().get("response", "No reply from model.")
+        data = response.json()
+        if "response" not in data:
+            return f"⚠️ Ollama error: {data}"
+        return data["response"]
     except Exception as e:
-        return f"Error: {e}"
+        return f"❌ Ollama Error: {e}"
+
+# -----------------------------
+# Helper: F1 Official Scraper
+# -----------------------------
+def f1_official_search(query, full_season=False):
+    """
+    Scrape formula1.com race results pages
+    If full_season=True, returns all races for all years
+    Otherwise, returns races matching query
+    """
+    base_url = "https://www.formula1.com/en/results.html"
+    results = []
+
+    # Years to scrape (adjust as needed)
+    for year in range(2021, 2025):  # update range for all years
+        url = f"{base_url}/{year}/races.html"
+        try:
+            r = requests.get(url, timeout=10)
+            if r.status_code != 200:
+                continue
+            soup = BeautifulSoup(r.text, "html.parser")
+            table_rows = soup.select("table.resultsarchive-table tbody tr")
+
+            for tr in table_rows:
+                race_tag = tr.select_one("td:nth-child(2) a")
+                winner_tag = tr.select_one("td:nth-child(3) a")
+                if race_tag and winner_tag:
+                    race_name = race_tag.get_text(strip=True)
+                    winner = winner_tag.get_text(strip=True)
+                    race_url = "https://www.formula1.com" + race_tag['href']
+
+                    if full_season or query.lower() in f"{race_name} {year}".lower():
+                        results.append({
+                            "race": race_name,
+                            "year": year,
+                            "winner": winner,
+                            "url": race_url
+                        })
+        except Exception:
+            continue
+
+    return results
 
 # -----------------------------
 # Streamlit UI
 # -----------------------------
 st.markdown("---")
-st.header("💬 F1 Chatbot")
+st.header("💬 F1 Chatbot (Official F1 + Ollama)")
 
-# Initialize chat history
+# Chat history
 if "messages" not in st.session_state:
     st.session_state.messages = []
 
@@ -446,38 +495,58 @@ for msg in st.session_state.messages:
     with st.chat_message(msg["role"]):
         st.write(msg["content"])
 
-# -----------------------------
 # Model selection
-# -----------------------------
-model_options = ["llama3", "llama3-7b", "llama3-13b"]
-selected_model = st.selectbox("Select model", model_options, index=0)
+selected_model = st.selectbox("Select Ollama Model", OLLAMA_MODELS, index=0)
 
 # User input
-user_input = st.chat_input("Ask anything about F1...")
+user_input = st.chat_input("Ask about F1 races or seasons...")
 
 if user_input:
-    # Save user message
+    # Show user message
     st.session_state.messages.append({"role": "user", "content": user_input})
     with st.chat_message("user"):
         st.write(user_input)
 
     # -----------------------------
-    # Construct prompt (system + user)
+    # Check if user asks for full season
     # -----------------------------
-    system_msg = (
-        "You are an expert Formula 1 assistant. "
-        "Only provide factual answers. "
-        "Focus on the 2022–2024 seasons. "
-        "If you don't know the answer, say 'I don't know'."
-    )
-    full_prompt = f"{system_msg}\nUser: {user_input}"
+    full_season = "season" in user_input.lower() or "all races" in user_input.lower()
 
     # -----------------------------
-    # Query the model
+    # 1️⃣ Get official F1 results
     # -----------------------------
-    reply = ask_ollama(full_prompt, model=selected_model)
+    official_results = f1_official_search(user_input, full_season=full_season)
 
-    # Save assistant response
-    st.session_state.messages.append({"role": "assistant", "content": reply})
-    with st.chat_message("assistant"):
-        st.write(reply)
+    # -----------------------------
+    # 2️⃣ Display official results if found
+    # -----------------------------
+    if official_results:
+        reply_lines = []
+        for r in official_results:
+            reply_lines.append(f"{r['year']} {r['race']}: {r['winner']}")
+        reply_text = "\n".join(reply_lines)
+
+        st.session_state.messages.append({"role": "assistant", "content": reply_text})
+        with st.chat_message("assistant"):
+            st.write(reply_text)
+
+        st.markdown("**Sources:**")
+        for r in official_results:
+            st.markdown(f"- [{r['race']} {r['year']}]({r['url']})")
+    else:
+        # -----------------------------
+        # 3️⃣ If no official data, fallback to Ollama
+        # -----------------------------
+        system_msg = (
+            "You are an expert Formula 1 assistant.\n"
+            "Try to answer based on official sources. "
+            "If information is missing, clearly state it is a guess.\n"
+            "Give concise and factual answers."
+        )
+        full_prompt = f"{system_msg}\n\nQuestion: {user_input}\nAnswer:"
+
+        reply = ask_ollama(full_prompt, model=selected_model)
+
+        st.session_state.messages.append({"role": "assistant", "content": reply})
+        with st.chat_message("assistant"):
+            st.write(f"⚠️ Official F1 data not found. Bot answer (may be guess):\n{reply}")
