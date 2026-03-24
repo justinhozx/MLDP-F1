@@ -402,33 +402,55 @@ else:
         })
        
 
-def ask_ollama(prompt):
+# ==================================================
+# F1 CHATBOT (MODEL-ONLY, PROMPT-BASED)
+# ==================================================
+import streamlit as st
+import requests
+
+# -----------------------------
+# Helper: query LLM (Ollama, prompt-based)
+# -----------------------------
+def ask_ollama(prompt, model="llama3"):
+    """
+    Sends a prompt to the local Ollama API and returns the response.
+    Works with older API versions that expect 'prompt' instead of 'messages'.
+    """
     try:
         response = requests.post(
             "http://localhost:11434/api/generate",
             json={
-                "model": "llama3",
+                "model": model,
                 "prompt": prompt,
+                "temperature": 0.0,  # deterministic factual answers
                 "stream": False
             }
         )
-        return response.json()["response"]
+        # Most local Ollama versions return {"response": "..."}
+        return response.json().get("response", "No reply from model.")
     except Exception as e:
         return f"Error: {e}"
-# ==================================================
-# F1 CHATBOT
-# ==================================================
+
+# -----------------------------
+# Streamlit UI
+# -----------------------------
 st.markdown("---")
 st.header("💬 F1 Chatbot")
 
-# Store chat history
+# Initialize chat history
 if "messages" not in st.session_state:
     st.session_state.messages = []
 
-# Display past messages
+# Display previous messages
 for msg in st.session_state.messages:
     with st.chat_message(msg["role"]):
         st.write(msg["content"])
+
+# -----------------------------
+# Model selection
+# -----------------------------
+model_options = ["llama3", "llama3-7b", "llama3-13b"]
+selected_model = st.selectbox("Select model", model_options, index=0)
 
 # User input
 user_input = st.chat_input("Ask anything about F1...")
@@ -436,29 +458,26 @@ user_input = st.chat_input("Ask anything about F1...")
 if user_input:
     # Save user message
     st.session_state.messages.append({"role": "user", "content": user_input})
-
     with st.chat_message("user"):
         st.write(user_input)
 
-    # Add context to FIX dumb answers
-    context = """
-    You are an expert Formula 1 assistant.
-    Always give accurate answers.
+    # -----------------------------
+    # Construct prompt (system + user)
+    # -----------------------------
+    system_msg = (
+        "You are an expert Formula 1 assistant. "
+        "Only provide factual answers. "
+        "Focus on the 2022–2024 seasons. "
+        "If you don't know the answer, say 'I don't know'."
+    )
+    full_prompt = f"{system_msg}\nUser: {user_input}"
 
-    Facts:
-    - 2021 champion: Max Verstappen
-    - 2022 champion: Max Verstappen
-    - 2023 champion: Max Verstappen
-    """
+    # -----------------------------
+    # Query the model
+    # -----------------------------
+    reply = ask_ollama(full_prompt, model=selected_model)
 
-    full_prompt = context + "\nUser: " + user_input
-
-    # Get response
-    reply = ask_ollama(full_prompt)
-
-    # Save assistant reply
+    # Save assistant response
     st.session_state.messages.append({"role": "assistant", "content": reply})
-
     with st.chat_message("assistant"):
         st.write(reply)
-        
