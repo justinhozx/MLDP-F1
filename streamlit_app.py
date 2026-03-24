@@ -93,14 +93,7 @@ if "race_name" not in df_app.columns and ("race_name_x" in df_app.columns or "ra
     if "race_name_y" in df_app.columns:
         df_app["race_name"] = df_app["race_name"].fillna(df_app["race_name_y"])
     df_app = df_app.drop(columns=[c for c in ["race_name_x", "race_name_y"] if c in df_app.columns])
-# --------------------------------------------------
-# LOAD FULL HISTORICAL DATA FOR CHATBOT (ALL YEARS)
-# --------------------------------------------------
-@st.cache_data
-def load_full_history():
-    return pd.read_csv("races.csv")  # should include all years, e.g., 2000–2024
 
-df_full = load_full_history()
 # --------------------------------------------------
 # SIDEBAR CONTROLS
 # --------------------------------------------------
@@ -422,12 +415,13 @@ def ask_ollama(prompt):
         return response.json()["response"]
     except Exception as e:
         return f"Error: {e}"
-# --------------------------------------------------
-# CHATBOT USING races.csv
-# --------------------------------------------------
+# ==================================================
+# F1 CHATBOT
+# ==================================================
 st.markdown("---")
 st.header("💬 F1 Chatbot")
 
+# Store chat history
 if "messages" not in st.session_state:
     st.session_state.messages = []
 
@@ -439,55 +433,32 @@ for msg in st.session_state.messages:
 # User input
 user_input = st.chat_input("Ask anything about F1...")
 
-def ask_ollama(prompt):
-    try:
-        response = requests.post(
-            "http://localhost:11434/api/generate",
-            json={"model": "llama3", "prompt": prompt, "stream": False}
-        )
-        return response.json().get("response", "")
-    except Exception as e:
-        return f"Error: {e}"
-
 if user_input:
+    # Save user message
     st.session_state.messages.append({"role": "user", "content": user_input})
+
     with st.chat_message("user"):
         st.write(user_input)
 
-    # Build context from races.csv + drivers.csv + constructors.csv
-    # Driver facts
-    driver_facts = []
-    for _, row in df_app.iterrows():
-        dname = DRIVER_ID_TO_NAME.get(int(row["driverId"]), f"driverId={int(row['driverId'])}")
-        cname = CONSTRUCTOR_ID_TO_NAME.get(int(row["constructorId"]), f"constructorId={int(row['constructorId'])}")
-        driver_facts.append(f"- {dname} drove for {cname} in {int(row['year'])}, round {int(row['round'])}")
-    driver_facts_str = "\n".join(driver_facts)
+    # Add context to FIX dumb answers
+    context = """
+    You are an expert Formula 1 assistant.
+    Always give accurate answers.
 
-    # Race facts from races.csv
-    race_facts = []
-    for _, row in races.iterrows():
-        race_name = row.get("name", f"raceId={int(row['raceId'])}")
-        year = int(row.get("year", 0))
-        round_no = int(row.get("round", 0))
-        race_facts.append(f"- Round {round_no} ({year}): {race_name}")
-    race_facts_str = "\n".join(race_facts)
+    Facts:
+    - 2021 champion: Max Verstappen
+    - 2022 champion: Max Verstappen
+    - 2023 champion: Max Verstappen
+    """
 
-    # Build full context
-    context = f"""
-You are an expert Formula 1 assistant.
-Always give accurate answers.
-
-Facts about drivers and teams:
-{driver_facts_str}
-
-Facts about races:
-{race_facts_str}
-
-Points system: 1st=25, 2nd=18, 3rd=15, 4th=12, 5th=10, 6th=8, 7th=6, 8th=4, 9th=2, 10th=1
-"""
     full_prompt = context + "\nUser: " + user_input
+
+    # Get response
     reply = ask_ollama(full_prompt)
 
+    # Save assistant reply
     st.session_state.messages.append({"role": "assistant", "content": reply})
+
     with st.chat_message("assistant"):
         st.write(reply)
+        
