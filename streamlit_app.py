@@ -2,6 +2,7 @@ import streamlit as st
 import pandas as pd
 import numpy as np
 import joblib
+import requests
 
 # ==========================================================
 # STREAMLIT APP — 2022–2024 ONLY
@@ -399,3 +400,65 @@ else:
             "What-if Team": str(constructor_name),
             "Predicted Finish": f"P{w_pred_pos}",
         })
+       
+
+def ask_ollama(prompt):
+    try:
+        response = requests.post(
+            "http://localhost:11434/api/generate",
+            json={
+                "model": "llama3",
+                "prompt": prompt,
+                "stream": False
+            }
+        )
+        return response.json()["response"]
+    except Exception as e:
+        return f"Error: {e}"
+# ==================================================
+# F1 CHATBOT
+# ==================================================
+st.markdown("---")
+st.header("💬 F1 Chatbot")
+
+# Store chat history
+if "messages" not in st.session_state:
+    st.session_state.messages = []
+
+# Display past messages
+for msg in st.session_state.messages:
+    with st.chat_message(msg["role"]):
+        st.write(msg["content"])
+
+# User input
+user_input = st.chat_input("Ask anything about F1...")
+
+if user_input:
+    # Save user message
+    st.session_state.messages.append({"role": "user", "content": user_input})
+
+    with st.chat_message("user"):
+        st.write(user_input)
+
+    # Add context to FIX dumb answers
+    context = """
+    You are an expert Formula 1 assistant.
+    Always give accurate answers.
+
+    Facts:
+    - 2021 champion: Max Verstappen
+    - 2022 champion: Max Verstappen
+    - 2023 champion: Max Verstappen
+    """
+
+    full_prompt = context + "\nUser: " + user_input
+
+    # Get response
+    reply = ask_ollama(full_prompt)
+
+    # Save assistant reply
+    st.session_state.messages.append({"role": "assistant", "content": reply})
+
+    with st.chat_message("assistant"):
+        st.write(reply)
+        
