@@ -443,11 +443,12 @@ else:
        
 
 # ==================================================
-# F1 CHATBOT (FINAL: STRICT FILTERING, ZERO HALLUCINATION)
+# F1 CHATBOT (FINAL: FLEXIBLE + STRICT + NICKNAMES)
 # ==================================================
 import streamlit as st
 import pandas as pd
 import re
+from difflib import get_close_matches
 
 # -----------------------------
 # LOAD DATA
@@ -459,7 +460,7 @@ constructors = pd.read_csv("archive/constructors.csv", na_values=[r"\N"])
 status = pd.read_csv("archive/status.csv", na_values=[r"\N"])
 
 # -----------------------------
-# MERGE DATA
+# MERGE
 # -----------------------------
 df = results.merge(races, on="raceId", how="left")
 df = df.merge(drivers, on="driverId", how="left")
@@ -467,15 +468,13 @@ df = df.merge(constructors, on="constructorId", how="left")
 df = df.merge(status, on="statusId", how="left")
 
 # -----------------------------
-# CLEAN + NORMALIZE
+# CLEAN
 # -----------------------------
 df['driver_name'] = (df['forename'] + " " + df['surname']).str.lower().str.strip()
 df['race_name'] = df['name_x'].str.lower().str.strip()
-df['constructor_name'] = df['name_y'].str.lower().str.strip()
 df['year'] = df['year'].astype(int)
 df['position_order'] = df['positionOrder'].astype(int)
 
-# Normalize race names
 df['race_name_norm'] = (
     df['race_name']
     .str.replace("grand prix", "", regex=False)
@@ -485,23 +484,28 @@ df['race_name_norm'] = (
 )
 
 # -----------------------------
-# DRIVER NORMALIZATION
+# DRIVER NORMALIZATION (UPGRADED)
 # -----------------------------
 driver_map = {
     "max": "max verstappen",
     "verstappen": "max verstappen",
-    "max verstappen": "max verstappen",
-
     "lewis": "lewis hamilton",
     "hamilton": "lewis hamilton",
-    "lewis hamilton": "lewis hamilton",
 }
 
 def normalize_driver(name):
-    return driver_map.get(name.lower().strip(), name.lower().strip())
+    name = name.lower().strip()
+    return driver_map.get(name, name)
+
+def extract_drivers(text):
+    found = []
+    for key in driver_map.keys():
+        if re.search(rf"\b{key}\b", text):
+            found.append(driver_map[key])
+    return list(set(found))
 
 # -----------------------------
-# GP NORMALIZATION
+# GP MATCH
 # -----------------------------
 def normalize_gp(text):
     text = text.lower()
@@ -509,9 +513,6 @@ def normalize_gp(text):
     text = re.sub(r"[^a-z\s]", "", text)
     return text.strip()
 
-# -----------------------------
-# STRICT RACE MATCHING (FIXED)
-# -----------------------------
 def get_race_id(gp_text, year):
     if not gp_text or not year:
         return None
@@ -519,37 +520,55 @@ def get_race_id(gp_text, year):
     gp_norm = normalize_gp(gp_text)
 
     season_df = df[df['year'] == year]
+    race_list = season_df['race_name_norm'].unique().tolist()
 
-    # 1️⃣ EXACT MATCH
-    exact = season_df[season_df['race_name_norm'] == gp_norm]
-    if not exact.empty:
-        return exact.iloc[0]['raceId']
+    # exact
+    if gp_norm in race_list:
+        return season_df[season_df['race_name_norm'] == gp_norm].iloc[0]['raceId']
 
-    # 2️⃣ WORD MATCH (SAFE)
-    gp_words = set(gp_norm.split())
-
-    for _, row in season_df.iterrows():
-        race_words = set(row['race_name_norm'].split())
-        if gp_words.issubset(race_words):
-            return row['raceId']
+    # fuzzy
+    match = get_close_matches(gp_norm, race_list, n=1, cutoff=0.6)
+    if match:
+        return season_df[season_df['race_name_norm'] == match[0]].iloc[0]['raceId']
 
     return None
 
 # -----------------------------
-# QUERY FUNCTIONS
+# QUERIES
 # -----------------------------
 def query_winner(race_id):
-    race_df = df[(df['raceId'] == race_id) & (df['position_order'] == 1)]
-    if race_df.empty:
-        return "❌ No winner found"
-
-    row = race_df.iloc[0]
+    row = df[(df['raceId']==race_id) & (df['position_order']==1)].iloc[0]
     return f"Winner of {row['year']} {row['race_name'].title()}: {row['driver_name'].title()}"
 
+def query_position(driver, race_id):
+    row = df[(df['raceId']==race_id) & (df['driver_name']==driver)]
+    if row.empty:
+        return f"{driver.title()}: ❌ Not found"
+    pos = int(row.iloc[0]['position_order'])
+    race = row.iloc[0]['race_name'].title()
+    return f"{driver.title()} finished P{pos} in {race}."
 
-def query_podium(drivers_list, race_id):
-    race_df = df[df['raceId'] == race_id]
+def query_compare(d1, d2, race_id):
+    race_df = df[df['raceId']==race_id]
 
+    r1 = race_df[race_df['driver_name']==d1]
+    r2 = race_df[race_df['driver_name']==d2]
+
+    if r1.empty or r2.empty:
+        return "❌ Driver not found"
+
+    p1 = int(r1.iloc[0]['position_order'])
+    p2 = int(r2.iloc[0]['position_order'])
+
+    if p1 < p2:
+        return f"{d1.title()} finished better than {d2.title()} (P{p1} vs P{p2})"
+    elif p2 < p1:
+        return f"{d2.title()} finished better than {d1.title()} (P{p2} vs P{p1})"
+    else:
+        return f"{d1.title()} and {d2.title()} finished equal (P{p1})"
+
+def query_podium(race_id):
+    race_df = df[df['raceId']==race_id]
     podium_df = race_df[race_df['position_order'].isin([1,2,3])].sort_values('position_order')
 
     podium = [
@@ -557,57 +576,13 @@ def query_podium(drivers_list, race_id):
         for _, r in podium_df.iterrows()
     ]
 
-    results = {}
-    for d in drivers_list:
-        d_norm = normalize_driver(d)
-        row = race_df[race_df['driver_name'] == d_norm]
-
-        if row.empty:
-            results[d.title()] = None
-        else:
-            results[d.title()] = int(row.iloc[0]['position_order'])
-
-    lines = []
-    for d, pos in results.items():
-        if pos is None:
-            lines.append(f"{d}: ❌ Not found")
-        elif pos <= 3:
-            lines.append(f"{d}: ✅ YES (P{pos})")
-        else:
-            lines.append(f"{d}: ❌ NO (P{pos})")
-
-    # who finished better
-    valid = {k: v for k, v in results.items() if v is not None}
-    sorted_drivers = sorted(valid, key=lambda x: valid[x])
-
-    better_lines = []
-    for i in range(len(sorted_drivers)-1):
-        better_lines.append(f"{sorted_drivers[i]} finished better than {sorted_drivers[i+1]}")
-
-    return (
-        "🏁 Podium:\n" + ", ".join(podium) + "\n\n"
-        + "\n".join(lines)
-        + ("\n" + "\n".join(better_lines) if better_lines else "")
-    )
-
-
-def query_position(driver, race_id):
-    driver_norm = normalize_driver(driver)
-    race_df = df[(df['raceId'] == race_id) & (df['driver_name'] == driver_norm)]
-
-    if race_df.empty:
-        return f"{driver.title()}: ❌ Not found"
-
-    pos = int(race_df.iloc[0]['position_order'])
-    race_name = race_df.iloc[0]['race_name'].title()
-
-    return f"{driver.title()} finished P{pos} in {race_name}."
-
+    race = podium_df.iloc[0]['race_name'].title()
+    return f"🏁 Podium {race}:\n" + ", ".join(podium)
 
 # -----------------------------
 # UI
 # -----------------------------
-st.header("💬 F1 Chatbot (Final Accurate Version)")
+st.header("💬 F1 Chatbot (Final Smart Version)")
 
 if "messages" not in st.session_state:
     st.session_state.messages = []
@@ -623,44 +598,52 @@ user_input = st.chat_input("Ask about F1...")
 # -----------------------------
 if user_input:
 
+    text = user_input.lower()
+
     with st.chat_message("user"):
         st.markdown(user_input)
 
-    st.session_state.messages.append({"role": "user", "content": user_input})
+    st.session_state.messages.append({"role":"user","content":user_input})
+
+    # YEAR
+    year_match = re.search(r"\d{4}", text)
+    year = int(year_match.group()) if year_match else None
+
+    # GP
+    gp_match = re.search(r"([a-z\s]+grand prix|[a-z\s]+gp)", text)
+    gp_text = gp_match.group(1) if gp_match else ""
+
+    race_id = get_race_id(gp_text, year)
+
+    drivers_found = extract_drivers(text)
 
     response = None
 
-    # YEAR
-    year_match = re.search(r"\d{4}", user_input)
-    year = int(year_match.group()) if year_match else None
-
-    # GP TEXT (FIXED)
-    gp_match = re.search(r"([A-Za-z\s]+Grand Prix|[A-Za-z\s]+GP)", user_input, re.IGNORECASE)
-    gp_text = gp_match.group(1) if gp_match else ""
-
-    race_id = get_race_id(gp_text, year) if year else None
+    # -------------------------
+    # PODIUM (supports: "2019 silverstone podium")
+    # -------------------------
+    if race_id and "podium" in text:
+        response = query_podium(race_id)
 
     # -------------------------
-    # INTENT DETECTION (ROBUST)
-    # -------------------------
-    text = user_input.lower()
-
     # WINNER
-    if race_id and any(x in text for x in ["winner", "who won", "won the race", "p1", "first place"]):
+    # -------------------------
+    elif race_id and any(x in text for x in ["who won","winner"]):
         response = query_winner(race_id)
 
-    # PODIUM
-    elif race_id and "podium" in text:
-        drivers = re.split(r",|and", text)
-        drivers = [d.strip() for d in drivers if len(d.strip()) < 20][:3]
-        response = query_podium(drivers, race_id)
+    # -------------------------
+    # POSITION (supports "what place did")
+    # -------------------------
+    elif race_id and ("place" in text or "position" in text):
+        if drivers_found:
+            response = query_position(drivers_found[0], race_id)
 
-    # POSITION
-    elif race_id and "position" in text:
-        match = re.search(r"position did (.+?) finish", text)
-        if match:
-            driver = match.group(1)
-            response = query_position(driver, race_id)
+    # -------------------------
+    # BETTER THAN (flexible)
+    # -------------------------
+    elif race_id and ("better" in text or "ahead" in text):
+        if len(drivers_found) >= 2:
+            response = query_compare(drivers_found[0], drivers_found[1], race_id)
 
     # -------------------------
     # FAIL SAFE
@@ -671,4 +654,4 @@ if user_input:
     with st.chat_message("assistant"):
         st.markdown(response)
 
-    st.session_state.messages.append({"role": "assistant", "content": response})
+    st.session_state.messages.append({"role":"assistant","content":response})
