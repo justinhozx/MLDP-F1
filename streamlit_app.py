@@ -93,10 +93,10 @@ MODEL, EXPECTED_X_COLS, FEATURE_COLS = load_model_and_meta()
 # --------------------------------------------------
 @st.cache_data
 def load_lookups():
-    drivers = pd.read_csv("drivers.csv")
-    constructors = pd.read_csv("constructors.csv")
-    races = pd.read_csv("races.csv")
-    circuits = pd.read_csv("circuits.csv")
+    drivers = pd.read_csv("archive/drivers.csv")
+    constructors = pd.read_csv("archive/constructors.csv")
+    races = pd.read_csv("archive/races.csv")
+    circuits = pd.read_csv("archive/circuits.csv")
     return drivers, constructors, races, circuits
 
 drivers, constructors, races, circuits = load_lookups()
@@ -115,7 +115,7 @@ RACE_ID_TO_NAME = dict(zip(races["raceId"], races["name"])) if "raceId" in races
 # --------------------------------------------------
 @st.cache_data
 def load_engineered():
-    return pd.read_csv("df_app_2022_2024.csv")
+    return pd.read_csv("archive/df_app_2022_2024.csv")
 
 df_app = load_engineered()
 df_app = df_app[df_app["year"].between(2022, 2024)].copy()
@@ -443,119 +443,232 @@ else:
        
 
 # ==================================================
-# F1 CHATBOT (RAG STYLE + Ollama, using winners.csv)
+# F1 CHATBOT (FINAL: STRICT FILTERING, ZERO HALLUCINATION)
 # ==================================================
 import streamlit as st
 import pandas as pd
-import faiss
-from sentence_transformers import SentenceTransformer
-import requests
-import numpy as np
+import re
 
 # -----------------------------
-# LOAD CSV
+# LOAD DATA
 # -----------------------------
-winners = pd.read_csv("archive/winners.csv", na_values=[r"\N"])
-
-# Optional: clean whitespace in Winner/Car
-winners['Winner'] = winners['Winner'].str.strip()
-winners['Car'] = winners['Car'].str.strip()
-
-# -----------------------------
-# VECTOR DATABASE
-# -----------------------------
-st.info("Initializing vector database... (first run may be slow)")
-
-embed_model = SentenceTransformer("sentence-transformers/all-MiniLM-L6-v2")
-
-corpus_texts = []
-corpus_metadata = []
-
-for _, row in winners.iterrows():
-    text = f"{row['Grand Prix']} ({row['Date']}) winner: {row['Winner']} car: {row['Car']} laps: {row['Laps']} time: {row['Time']}"
-    corpus_texts.append(text)
-    corpus_metadata.append(row.to_dict())
-
-corpus_embeddings = embed_model.encode(corpus_texts, convert_to_numpy=True, show_progress_bar=True)
-
-# FAISS index
-dimension = corpus_embeddings.shape[1]
-index = faiss.IndexFlatIP(dimension)  # inner product for cosine similarity
-faiss.normalize_L2(corpus_embeddings)
-index.add(corpus_embeddings)
+results = pd.read_csv("archive/results.csv", na_values=[r"\N"])
+races = pd.read_csv("archive/races.csv", na_values=[r"\N"])
+drivers = pd.read_csv("archive/drivers.csv", na_values=[r"\N"])
+constructors = pd.read_csv("archive/constructors.csv", na_values=[r"\N"])
+status = pd.read_csv("archive/status.csv", na_values=[r"\N"])
 
 # -----------------------------
-# RAG QUERY FUNCTION
+# MERGE DATA
 # -----------------------------
-def query_f1_rag(user_query, top_k=5, threshold=0.6):
-    query_vec = embed_model.encode([user_query], convert_to_numpy=True)
-    faiss.normalize_L2(query_vec)
-    D, I = index.search(query_vec, top_k)
-
-    retrieved_context = []
-    for score, idx in zip(D[0], I[0]):
-        if score < threshold:
-            continue
-        row = corpus_metadata[idx]
-        retrieved_context.append(
-            f"{row['Grand Prix']} ({row['Date']}) winner: {row['Winner']} car: {row['Car']} laps: {row['Laps']} time: {row['Time']}"
-        )
-    return retrieved_context
+df = results.merge(races, on="raceId", how="left")
+df = df.merge(drivers, on="driverId", how="left")
+df = df.merge(constructors, on="constructorId", how="left")
+df = df.merge(status, on="statusId", how="left")
 
 # -----------------------------
-# Ollama Helper
+# CLEAN + NORMALIZE
 # -----------------------------
-def ask_ollama(prompt, model="llama3:latest"):
-    try:
-        response = requests.post(
-            "http://localhost:11434/api/generate",
-            json={"model": model, "prompt": prompt, "temperature": 0.2, "stream": False},
-            timeout=60
-        )
-        data = response.json()
-        return data.get("response", f"⚠️ Ollama error: {data}")
-    except Exception as e:
-        return f"❌ Ollama Error: {e}"
+df['driver_name'] = (df['forename'] + " " + df['surname']).str.lower().str.strip()
+df['race_name'] = df['name_x'].str.lower().str.strip()
+df['constructor_name'] = df['name_y'].str.lower().str.strip()
+df['year'] = df['year'].astype(int)
+df['position_order'] = df['positionOrder'].astype(int)
+
+# Normalize race names
+df['race_name_norm'] = (
+    df['race_name']
+    .str.replace("grand prix", "", regex=False)
+    .str.replace("gp", "", regex=False)
+    .str.replace(r"[^a-z\s]", "", regex=True)
+    .str.strip()
+)
 
 # -----------------------------
-# STREAMLIT UI
+# DRIVER NORMALIZATION
 # -----------------------------
-st.header("💬 F1 Chatbot (RAG Style + Ollama)")
+driver_map = {
+    "max": "max verstappen",
+    "verstappen": "max verstappen",
+    "max verstappen": "max verstappen",
+
+    "lewis": "lewis hamilton",
+    "hamilton": "lewis hamilton",
+    "lewis hamilton": "lewis hamilton",
+}
+
+def normalize_driver(name):
+    return driver_map.get(name.lower().strip(), name.lower().strip())
+
+# -----------------------------
+# GP NORMALIZATION
+# -----------------------------
+def normalize_gp(text):
+    text = text.lower()
+    text = text.replace("grand prix", "").replace("gp", "")
+    text = re.sub(r"[^a-z\s]", "", text)
+    return text.strip()
+
+# -----------------------------
+# STRICT RACE MATCHING (FIXED)
+# -----------------------------
+def get_race_id(gp_text, year):
+    if not gp_text or not year:
+        return None
+
+    gp_norm = normalize_gp(gp_text)
+
+    season_df = df[df['year'] == year]
+
+    # 1️⃣ EXACT MATCH
+    exact = season_df[season_df['race_name_norm'] == gp_norm]
+    if not exact.empty:
+        return exact.iloc[0]['raceId']
+
+    # 2️⃣ WORD MATCH (SAFE)
+    gp_words = set(gp_norm.split())
+
+    for _, row in season_df.iterrows():
+        race_words = set(row['race_name_norm'].split())
+        if gp_words.issubset(race_words):
+            return row['raceId']
+
+    return None
+
+# -----------------------------
+# QUERY FUNCTIONS
+# -----------------------------
+def query_winner(race_id):
+    race_df = df[(df['raceId'] == race_id) & (df['position_order'] == 1)]
+    if race_df.empty:
+        return "❌ No winner found"
+
+    row = race_df.iloc[0]
+    return f"Winner of {row['year']} {row['race_name'].title()}: {row['driver_name'].title()}"
+
+
+def query_podium(drivers_list, race_id):
+    race_df = df[df['raceId'] == race_id]
+
+    podium_df = race_df[race_df['position_order'].isin([1,2,3])].sort_values('position_order')
+
+    podium = [
+        f"{r['driver_name'].title()} (P{r['position_order']})"
+        for _, r in podium_df.iterrows()
+    ]
+
+    results = {}
+    for d in drivers_list:
+        d_norm = normalize_driver(d)
+        row = race_df[race_df['driver_name'] == d_norm]
+
+        if row.empty:
+            results[d.title()] = None
+        else:
+            results[d.title()] = int(row.iloc[0]['position_order'])
+
+    lines = []
+    for d, pos in results.items():
+        if pos is None:
+            lines.append(f"{d}: ❌ Not found")
+        elif pos <= 3:
+            lines.append(f"{d}: ✅ YES (P{pos})")
+        else:
+            lines.append(f"{d}: ❌ NO (P{pos})")
+
+    # who finished better
+    valid = {k: v for k, v in results.items() if v is not None}
+    sorted_drivers = sorted(valid, key=lambda x: valid[x])
+
+    better_lines = []
+    for i in range(len(sorted_drivers)-1):
+        better_lines.append(f"{sorted_drivers[i]} finished better than {sorted_drivers[i+1]}")
+
+    return (
+        "🏁 Podium:\n" + ", ".join(podium) + "\n\n"
+        + "\n".join(lines)
+        + ("\n" + "\n".join(better_lines) if better_lines else "")
+    )
+
+
+def query_position(driver, race_id):
+    driver_norm = normalize_driver(driver)
+    race_df = df[(df['raceId'] == race_id) & (df['driver_name'] == driver_norm)]
+
+    if race_df.empty:
+        return f"{driver.title()}: ❌ Not found"
+
+    pos = int(race_df.iloc[0]['position_order'])
+    race_name = race_df.iloc[0]['race_name'].title()
+
+    return f"{driver.title()} finished P{pos} in {race_name}."
+
+
+# -----------------------------
+# UI
+# -----------------------------
+st.header("💬 F1 Chatbot (Final Accurate Version)")
 
 if "messages" not in st.session_state:
     st.session_state.messages = []
 
-# Display chat history
 for msg in st.session_state.messages:
     with st.chat_message(msg["role"]):
-        st.markdown(f"```\n{msg['content']}\n```")
+        st.markdown(msg["content"])
 
-# Ollama model selection
-OLLAMA_MODELS = ["llama3:latest", "gpt-oss:20b"]
-selected_model = st.selectbox("Select Ollama Model", OLLAMA_MODELS, index=0)
+user_input = st.chat_input("Ask about F1...")
 
-# User input
-user_input = st.chat_input("Ask about F1 races, drivers, or seasons...")
-
+# -----------------------------
+# MAIN LOGIC
+# -----------------------------
 if user_input:
-    st.session_state.messages.append({"role": "user", "content": user_input})
-    with st.chat_message("user"):
-        st.markdown(f"```\n{user_input}\n```")
 
-    # 1️⃣ Retrieve context from winners.csv
-    context_rows = query_f1_rag(user_input, top_k=5)
-    
-    if context_rows:
-        context_text = "\n".join(context_rows)
-        full_prompt = f"You are an expert Formula 1 assistant. Use the following data to answer the user's question:\n\n{context_text}\n\nQuestion: {user_input}\nAnswer in natural language:"
-        reply = ask_ollama(full_prompt, model=selected_model)
-        st.session_state.messages.append({"role": "assistant", "content": reply})
-        with st.chat_message("assistant"):
-            st.markdown(f"**Answer:**\n```\n{reply}\n```")
-    else:
-        # 2️⃣ Fallback if nothing matches
-        full_prompt = f"You are an expert Formula 1 assistant. Data not found in winners.csv. Answer based on general knowledge.\nQuestion: {user_input}\nAnswer:"
-        reply = ask_ollama(full_prompt, model=selected_model)
-        st.session_state.messages.append({"role": "assistant", "content": reply})
-        with st.chat_message("assistant"):
-            st.markdown(f"⚠️ Data not found, bot answer:\n```\n{reply}\n```")
+    with st.chat_message("user"):
+        st.markdown(user_input)
+
+    st.session_state.messages.append({"role": "user", "content": user_input})
+
+    response = None
+
+    # YEAR
+    year_match = re.search(r"\d{4}", user_input)
+    year = int(year_match.group()) if year_match else None
+
+    # GP TEXT (FIXED)
+    gp_match = re.search(r"([A-Za-z\s]+Grand Prix|[A-Za-z\s]+GP)", user_input, re.IGNORECASE)
+    gp_text = gp_match.group(1) if gp_match else ""
+
+    race_id = get_race_id(gp_text, year) if year else None
+
+    # -------------------------
+    # INTENT DETECTION (ROBUST)
+    # -------------------------
+    text = user_input.lower()
+
+    # WINNER
+    if race_id and any(x in text for x in ["winner", "who won", "won the race", "p1", "first place"]):
+        response = query_winner(race_id)
+
+    # PODIUM
+    elif race_id and "podium" in text:
+        drivers = re.split(r",|and", text)
+        drivers = [d.strip() for d in drivers if len(d.strip()) < 20][:3]
+        response = query_podium(drivers, race_id)
+
+    # POSITION
+    elif race_id and "position" in text:
+        match = re.search(r"position did (.+?) finish", text)
+        if match:
+            driver = match.group(1)
+            response = query_position(driver, race_id)
+
+    # -------------------------
+    # FAIL SAFE
+    # -------------------------
+    if not response:
+        response = "❌ Could not match query precisely."
+
+    with st.chat_message("assistant"):
+        st.markdown(response)
+
+    st.session_state.messages.append({"role": "assistant", "content": response})
