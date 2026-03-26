@@ -443,14 +443,13 @@ else:
        
 
 # ==================================================
-# F1 CHATBOT — PRODUCTION SAFE (UTF-8 + MULTI-INTENT)
-# Supports race-level queries, season champions, and dynamic driver comparisons
+# F1 Chatbot — Hybrid CSV + LLM Engine (Fixed)
 # ==================================================
-
 import streamlit as st
 import pandas as pd
 import subprocess
 import json
+from rapidfuzz import process, fuzz
 
 # -----------------------------
 # LOAD DATA
@@ -463,7 +462,7 @@ driver_standings = pd.read_csv("archive/driver_standings.csv", na_values=[r"\N"]
 constructor_standings = pd.read_csv("archive/constructor_standings.csv", na_values=[r"\N"])
 
 # -----------------------------
-# LLM INTENT PARSER (SAFE)
+# LLM INTENT PARSER
 # -----------------------------
 def interpret_query(prompt, model="llama3:latest"):
     system_prompt = """
@@ -487,42 +486,7 @@ Extract:
 - driver or drivers (if applicable)
 - condition (for multi-driver checks, optional)
 
-Rules:
-- winner -> positions [1]
-- podium -> [1,2,3]
-- top N -> [1..N]
-- last -> [-1]
-
-Examples:
-
-"Bahrain 2021 podium"
--> {"year":2021,"race":"bahrain","query_type":"position_lookup","positions":[1,2,3]}
-
-"What place did Max finish in 2019 British?"
--> {"year":2019,"race":"british","query_type":"driver_position","driver":"max verstappen"}
-
-"Who finished ahead of Hamilton in Bahrain 2021?"
--> {"year":2021,"race":"bahrain","query_type":"ahead_of_driver","driver":"lewis hamilton"}
-
-"Who finished behind Leclerc in Bahrain 2021?"
--> {"year":2021,"race":"bahrain","query_type":"behind_driver","driver":"charles leclerc"}
-
-"Who retired in Bahrain 2021?"
--> {"year":2021,"race":"bahrain","query_type":"retirements"}
-
-"Who was the 2019 champion?"
--> {"year":2019,"query_type":"season_champion"}
-
-"Who won the 2020 constructors championship?"
--> {"year":2020,"query_type":"constructor_champion"}
-
-"Did Lewis finish ahead of Max in 2019 Silverstone GP?"
--> {"year":2019,"race":"silverstone","query_type":"compare_drivers","drivers":["lewis hamilton","max verstappen"]}
-
-"Did Max and Lewis both finish on the podium for 2017 Suzuka GP?"
--> {"year":2017,"race":"suzuka","query_type":"multi_driver_position_check","drivers":["max verstappen","lewis hamilton"],"condition":"podium"}
-
-ONLY return JSON. No explanation.
+Return ONLY JSON.
 """
     try:
         result = subprocess.run(
@@ -543,187 +507,143 @@ ONLY return JSON. No explanation.
         return {"error": str(e)}
 
 # -----------------------------
+# FUZZY MATCHING HELPERS
+# -----------------------------
+def match_race(race_keyword, year):
+    candidates = races[races['year'] == year]['name'].tolist()
+    best = process.extractOne(race_keyword, candidates, scorer=fuzz.token_sort_ratio)
+    if best and best.score > 70:
+        match = best[0]
+        return races[(races['year'] == year) & (races['name'] == match)].iloc[0]
+    return None
+
+def match_driver(driver_name):
+    driver_name = driver_name.lower()
+    full_names = (drivers['forename'] + " " + drivers['surname']).str.lower().tolist()
+    best = process.extractOne(driver_name, full_names, scorer=fuzz.token_sort_ratio)
+    if best and best.score > 70:
+        match = best[0]
+        row = drivers[(drivers['forename'] + " " + drivers['surname']).str.lower() == match]
+        return row.iloc[0]
+    return None
+
+# -----------------------------
 # GET RACE RESULTS
 # -----------------------------
 def get_race_results(year, race_keyword):
     if not race_keyword:
         return None, None
-    race_row = races[
-        (races['year'] == year) &
-        (races['name'].str.lower().str.contains(race_keyword.lower(), regex=False))
-    ]
-    if race_row.empty:
+    race_row = match_race(race_keyword, year)
+    if race_row is None:
         return None, None
-    race_id = race_row.iloc[0]['raceId']
-    race_name = race_row.iloc[0]['name']
+    race_id = race_row['raceId']
+    race_name = race_row['name']
     race_results = results[results['raceId'] == race_id].merge(drivers, on='driverId')
     race_results = race_results.sort_values("positionOrder")
-    race_results["full_name"] = (
-        race_results["forename"].str.lower().str.strip() + " " +
-        race_results["surname"].str.lower().str.strip()
-    )
+    race_results["full_name"] = (race_results["forename"].str.lower().str.strip() + " " +
+                                 race_results["surname"].str.lower().str.strip())
     return race_results, race_name
 
 # -----------------------------
-# ANSWER ENGINE
+# ANSWER ENGINE (HYBRID)
 # -----------------------------
-def answer_query(race_results, parsed):
+def answer_query_hybrid(race_results, parsed, original_prompt):
     qtype = parsed.get("query_type")
 
-    # ----------------- POSITION LOOKUP -----------------
+    # Fallback function using LLM reasoning if CSV missing
+    def llm_fallback(prompt):
+        system_prompt = f"""
+You are an F1 expert. Use your knowledge to answer the question accurately.
+Question: {prompt}
+Answer in plain text.
+"""
+        try:
+            result = subprocess.run(
+                ["ollama", "run", "llama3:latest"],
+                input=system_prompt,
+                capture_output=True,
+                text=True,
+                encoding="utf-8"
+            )
+            return result.stdout.strip()
+        except:
+            return "Could not answer the question."
+
+    # ----------------- POSITION LOOKUP (MULTI DRIVER) -----------------
     if qtype == "position_lookup":
-        positions = parsed.get("positions", [])
         if race_results is None:
-            return "Race not found."
-        if positions == [-1]:
-            row = race_results.iloc[-1]
-            return f"Last place: {row['forename']} {row['surname']}"
-        filtered = race_results[race_results["positionOrder"].isin(positions)]
-        return "\n".join([
-            f"P{int(r['positionOrder'])}: {r['forename']} {r['surname']} - {r['points']} pts"
-            for _, r in filtered.iterrows()
-        ])
+            return llm_fallback(original_prompt)
+        drivers_list = parsed.get("driver", [])
+        if not drivers_list:
+            return "No drivers specified."
+        answers = []
+        for d in drivers_list:
+            driver_row = match_driver(d)
+            if driver_row is None:
+                answers.append(f"{d} not found in CSV.")
+                continue
+            driver_full = driver_row['forename'].lower() + " " + driver_row['surname'].lower()
+            row = race_results[race_results["full_name"] == driver_full]
+            if row.empty:
+                answers.append(f"{d} not found in race results.")
+            else:
+                answers.append(f"{row.iloc[0]['forename']} {row.iloc[0]['surname']} finished P{int(row.iloc[0]['positionOrder'])}")
+        return "\n".join(answers)
 
-    # ----------------- DRIVER POSITION -----------------
-    elif qtype == "driver_position":
-        driver = parsed.get("driver", "").strip().lower()
+    # ----------------- DRIVER POSITION / AHEAD / BEHIND -----------------
+    if qtype in ["ahead_of_driver", "behind_driver", "driver_position"]:
         if race_results is None:
-            return "Race not found."
-        row = race_results[race_results["full_name"].str.contains(driver, regex=False)]
+            return llm_fallback(original_prompt)
+        driver_name = parsed.get("driver", "")
+        driver_row = match_driver(driver_name)
+        if driver_row is None:
+            return llm_fallback(original_prompt)
+        driver_full = driver_row['forename'].lower() + " " + driver_row['surname'].lower()
+        row = race_results[race_results["full_name"] == driver_full]
         if row.empty:
-            return "Driver not found."
-        row = row.iloc[0]
-        return f"{row['forename']} {row['surname']} finished P{int(row['positionOrder'])}"
-
-    # ----------------- AHEAD OF DRIVER -----------------
-    elif qtype == "ahead_of_driver":
-        driver = parsed.get("driver", "").strip().lower()
-        if race_results is None:
-            return "Race not found."
-        row = race_results[race_results["full_name"].str.contains(driver, regex=False)]
-        if row.empty:
-            return "Driver not found."
+            return llm_fallback(original_prompt)
         pos = int(row.iloc[0]["positionOrder"])
-        ahead = race_results[race_results["positionOrder"] < pos]
-        return "\n".join([
-            f"P{int(r['positionOrder'])}: {r['forename']} {r['surname']}"
-            for _, r in ahead.iterrows()
-        ])
-
-    # ----------------- BEHIND DRIVER -----------------
-    elif qtype == "behind_driver":
-        driver = parsed.get("driver", "").strip().lower()
-        if race_results is None:
-            return "Race not found."
-        row = race_results[race_results["full_name"].str.contains(driver, regex=False)]
-        if row.empty:
-            return "Driver not found."
-        pos = int(row.iloc[0]["positionOrder"])
-        behind = race_results[race_results["positionOrder"] > pos]
-        return "\n".join([
-            f"P{int(r['positionOrder'])}: {r['forename']} {r['surname']}"
-            for _, r in behind.iterrows()
-        ])
-
-    # ----------------- RETIREMENTS -----------------
-    elif qtype == "retirements":
-        if race_results is None:
-            return "Race not found."
-        retired = race_results[race_results["positionText"].str.upper() == "R"]
-        if retired.empty:
-            return "No retirements."
-        return "\n".join([f"{r['forename']} {r['surname']} (DNF)" for _, r in retired.iterrows()])
-
-    # ----------------- SEASON CHAMPION -----------------
-    elif qtype == "season_champion":
-        year = parsed.get("year")
-        if not year:
-            return "Please provide a year."
-        season_races = races[races["year"] == year]
-        if season_races.empty:
-            return f"No race data for {year}."
-        last_race_id = season_races["raceId"].max()
-        season_driver_standings = driver_standings[driver_standings["raceId"] == last_race_id]
-        season_driver_standings = season_driver_standings.merge(drivers, on="driverId")
-        champion_row = season_driver_standings[season_driver_standings["position"] == 1]
-        if champion_row.empty:
-            return f"No champion found for {year}."
-        champ = champion_row.iloc[0]
-        return f"The {year} F1 World Champion was {champ['forename']} {champ['surname']} with {champ['points']} points."
-
-    # ----------------- CONSTRUCTOR CHAMPION -----------------
-    elif qtype == "constructor_champion":
-        year = parsed.get("year")
-        season_races = races[races["year"] == year]
-        if season_races.empty:
-            return f"No race data for {year}."
-        last_race_id = season_races["raceId"].max()
-        season_constructor_standings = constructor_standings[constructor_standings["raceId"] == last_race_id]
-        season_constructor_standings = season_constructor_standings.merge(constructors, on="constructorId")
-        champion_row = season_constructor_standings[season_constructor_standings["position"] == 1]
-        if champion_row.empty:
-            return f"No constructor champion found for {year}."
-        champ = champion_row.iloc[0]
-        return f"The {year} Constructor Champion was {champ['name']} with {champ['points']} points."
+        if qtype == "ahead_of_driver":
+            ahead = race_results[race_results["positionOrder"] < pos]
+            return "\n".join([f"P{int(r['positionOrder'])}: {r['forename']} {r['surname']}" for _, r in ahead.iterrows()])
+        if qtype == "behind_driver":
+            behind = race_results[race_results["positionOrder"] > pos]
+            return "\n".join([f"P{int(r['positionOrder'])}: {r['forename']} {r['surname']}" for _, r in behind.iterrows()])
+        if qtype == "driver_position":
+            return f"{row.iloc[0]['forename']} {row.iloc[0]['surname']} finished P{pos}"
 
     # ----------------- COMPARE TWO DRIVERS -----------------
-    elif qtype == "compare_drivers":
-        drivers_list = [d.strip().lower() for d in parsed.get("drivers", [])]
+    if qtype == "compare_drivers":
+        if race_results is None:
+            return llm_fallback(original_prompt)
+        drivers_list = parsed.get("drivers", [])
         if len(drivers_list) != 2:
-            return "Need exactly 2 drivers to compare."
-        if race_results is None:
-            return "Race not found."
-        driver_rows = race_results[race_results["full_name"].isin(drivers_list)]
-        if len(driver_rows) != 2:
-            return "One or both drivers not found in this race."
-        driver1, driver2 = driver_rows.iloc[0], driver_rows.iloc[1]
-        if driver1["positionOrder"] < driver2["positionOrder"]:
-            return f"{driver1['forename']} {driver1['surname']} finished ahead of {driver2['forename']} {driver2['surname']}."
-        elif driver1["positionOrder"] > driver2["positionOrder"]:
-            return f"{driver2['forename']} {driver2['surname']} finished ahead of {driver1['forename']} {driver1['surname']}."
+            return "Need exactly 2 drivers."
+        rows = []
+        for d in drivers_list:
+            driver_row = match_driver(d)
+            if driver_row is None:
+                return llm_fallback(original_prompt)
+            driver_full = driver_row['forename'].lower() + " " + driver_row['surname'].lower()
+            row = race_results[race_results["full_name"] == driver_full]
+            if row.empty:
+                return llm_fallback(original_prompt)
+            rows.append(row.iloc[0])
+        d1, d2 = rows
+        if d1["positionOrder"] < d2["positionOrder"]:
+            return f"{d1['forename']} {d1['surname']} finished ahead of {d2['forename']} {d2['surname']}."
+        elif d1["positionOrder"] > d2["positionOrder"]:
+            return f"{d2['forename']} {d2['surname']} finished ahead of {d1['forename']} {d1['surname']}."
         else:
-            return f"Both drivers finished in the same position: P{driver1['positionOrder']}."
+            return f"Both drivers finished P{d1['positionOrder']}."
 
-    # ----------------- MULTI DRIVER CONDITION CHECK -----------------
-    elif qtype == "multi_driver_position_check":
-        drivers_list = [d.strip().lower() for d in parsed.get("drivers", [])]
-        condition = parsed.get("condition", "podium")
-        if race_results is None:
-            return "Race not found."
-        driver_rows = race_results[race_results["full_name"].isin(drivers_list)]
-        if len(driver_rows) != len(drivers_list):
-            return "One or more drivers not found in this race."
-
-        def check_condition(row):
-            if condition.startswith("podium"):
-                return row["positionOrder"] in [1,2,3]
-            elif condition.startswith("top"):
-                N = int(condition.replace("top",""))
-                return row["positionOrder"] <= N
-            elif condition.lower() == "dnf":
-                return row["positionText"].upper() in ["R","DNF"]
-            return False
-
-        all_pass = all(check_condition(r) for _, r in driver_rows.iterrows())
-        if all_pass:
-            return f"All drivers ({', '.join([r['forename'] + ' ' + r['surname'] for _, r in driver_rows.iterrows()])}) satisfy the condition: {condition}."
-        else:
-            return f"Not all drivers satisfy the condition. Positions: " + ", ".join([f"{r['forename']} P{r['positionOrder']}" for _, r in driver_rows.iterrows()])
-
-    return "Could not interpret query."
-
-# -----------------------------
-# TABLE DISPLAY
-# -----------------------------
-def format_table(race_results):
-    df = race_results[["positionOrder","forename","surname","points","positionText"]].copy()
-    df.columns = ["Position","First Name","Last Name","Points","Status"]
-    return df
+    # ----------------- FALLBACK -----------------
+    return llm_fallback(original_prompt)
 
 # -----------------------------
 # STREAMLIT UI
 # -----------------------------
-st.title("F1 Chatbot - LLM Intent Engine (Safe Version)")
+st.title("F1 Chatbot - Hybrid CSV + LLM Engine")
 
 prompt = st.text_input("Ask anything about a race or championship:")
 
@@ -744,13 +664,14 @@ if prompt:
     race_results, race_name = get_race_results(year, race) if race else (None, None)
 
     if race and race_results is None:
-        st.error("Race not found.")
-        st.stop()
+        st.warning("Race not found in CSV, will attempt LLM fallback.")
 
-    if race:
+    if race and race_results is not None:
         st.markdown(f"### Race Found: {race_name} ({year})")
-        st.markdown("### Full Results")
-        st.dataframe(format_table(race_results))
+        st.dataframe(race_results[['positionOrder','forename','surname','points','positionText']].rename(
+            columns={"positionOrder":"Position","forename":"First Name","surname":"Last Name","points":"Points","positionText":"Status"}
+        ))
 
     st.markdown("### Answer")
-    st.write(answer_query(race_results, parsed))
+    answer = answer_query_hybrid(race_results, parsed, prompt)
+    st.write(answer)
