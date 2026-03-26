@@ -443,242 +443,135 @@ else:
        
 
 # ==================================================
-# F1 CHATBOT (FULL FIXED + "DO WELL" JUDGMENT")
+# F1 CHATBOT — Reliable Race Retrieval (Debug Mode)
 # ==================================================
+
 import streamlit as st
 import pandas as pd
+import subprocess
 import re
-import numpy as np
-from sentence_transformers import SentenceTransformer
-import faiss
 
 # -----------------------------
-# LOAD DATA
+# 🔥 LOAD DATA
 # -----------------------------
 results = pd.read_csv("archive/results.csv", na_values=[r"\N"])
 races = pd.read_csv("archive/races.csv", na_values=[r"\N"])
 drivers = pd.read_csv("archive/drivers.csv", na_values=[r"\N"])
 
-# merge for easy lookup
-df = results.merge(races, on="raceId").merge(drivers, on="driverId")
-
 # -----------------------------
-# CLEAN DATA
+# 🧰 HELPER FUNCTIONS
 # -----------------------------
-df['driver_name'] = (df['forename'] + " " + df['surname']).str.lower().str.strip()
-df['race_name'] = df['name'].str.lower().str.strip()
-df['year'] = df['year'].astype(int)
-df['position'] = df['positionOrder'].astype(int)
-
-# cleaned race names for embedding
-df['race_name_norm'] = (
-    df['race_name']
-    .str.replace("grand prix", "", regex=False)
-    .str.replace("gp", "", regex=False)
-    .str.replace(r"[^a-z\s]", "", regex=True)
-    .str.strip()
-)
-
-# -----------------------------
-# MODEL
-# -----------------------------
-model = SentenceTransformer("all-MiniLM-L6-v2")
-
-# -----------------------------
-# RACE EMBEDDINGS
-# -----------------------------
-race_list = df[['raceId', 'race_name_norm', 'year']].drop_duplicates()
-race_texts = (race_list['year'].astype(str) + " " + race_list['race_name_norm']).tolist()
-race_emb = model.encode(race_texts, convert_to_numpy=True)
-faiss.normalize_L2(race_emb)
-race_index = faiss.IndexFlatIP(race_emb.shape[1])
-race_index.add(race_emb)
-
-# -----------------------------
-# QUERY FUNCTIONS
-# -----------------------------
-def get_race(user_text):
-    year_match = re.search(r"\b\d{4}\b", user_text)
+def get_race_id(prompt: str):
+    """Extract year and race keyword from prompt, return raceId."""
+    # Detect year
+    year_match = re.search(r"\b(19|20)\d{2}\b", prompt)
     if not year_match:
+        return None, None
+    year = int(year_match.group(0))
+
+    # Take everything before the year as race keyword
+    race_name_match = re.search(r"(.*?)\s+" + str(year), prompt, re.IGNORECASE)
+    if not race_name_match:
+        return None, None
+    race_keyword = race_name_match.group(1).strip().lower()
+
+    # Substring match to find race
+    race_row = races[
+        (races['year'] == year) &
+        (races['name'].str.lower().str.contains(race_keyword))
+    ]
+    if race_row.empty:
+        return None, None
+
+    race_id = race_row.iloc[0]['raceId']
+    race_full_name = race_row.iloc[0]['name']
+    return race_id, race_full_name
+
+def get_full_race_results(race_id: int):
+    """Retrieve all results for a race, merge with driver names, sort by positionOrder."""
+    race_results = results[results["raceId"] == race_id].copy()
+    if race_results.empty:
         return None
-    year = int(year_match.group())
-    words = re.findall(r"[a-z]+", user_text.lower())
+    # Merge driver info
+    race_results = race_results.merge(drivers, on='driverId', how='left')
+    race_results = race_results.sort_values("positionOrder")
+    return race_results
 
-    candidate_races = df[['raceId', 'race_name_norm', 'year']].drop_duplicates()
-    candidate_races = candidate_races[candidate_races['year'] == year]
+def format_race_results_for_display(race_results: pd.DataFrame):
+    """Format the race results for display in Streamlit."""
+    display_df = race_results[["positionOrder", "forename", "surname", "points", "time"]].copy()
+    display_df.rename(columns={
+        "positionOrder": "Position",
+        "forename": "First Name",
+        "surname": "Last Name",
+        "points": "Points",
+        "time": "Race Time"
+    }, inplace=True)
+    return display_df
 
-    best_score = 0
-    best_race_id = None
-
-    for _, row in candidate_races.iterrows():
-        race_words = row['race_name_norm'].split()
-        # sum of lengths of words that appear in user text
-        score = sum(len(w) for w in race_words if w in words)
-        if score > best_score:
-            best_score = score
-            best_race_id = row['raceId']
-
-    return best_race_id
-
-def match_drivers_in_race(text, race_id):
-    race_drivers = df[df['raceId'] == race_id]['driver_name'].unique().tolist()
-    if not race_drivers:
-        return []
-    emb = model.encode(race_drivers, convert_to_numpy=True)
-    faiss.normalize_L2(emb)
-    index = faiss.IndexFlatIP(emb.shape[1])
-    index.add(emb)
-    words = re.findall(r"[a-z]+", text.lower())
-    matches = []
-    for w in words:
-        vec = model.encode([w], convert_to_numpy=True)
-        faiss.normalize_L2(vec)
-        k = min(5, len(race_drivers))
-        D, I = index.search(vec, k)
-        for idx, score in zip(I[0], D[0]):
-            if score > 0.5:
-                matches.append(race_drivers[idx])
-    seen = set()
-    unique = []
-    for m in matches:
-        if m not in seen:
-            unique.append(m)
-            seen.add(m)
-    return unique
-
-def get_position(driver, race_id):
-    row = df[(df['raceId']==race_id) & (df['driver_name']==driver)]
-    if row.empty:
-        return None
-    return int(row.iloc[0]['position'])
-
-def compare(d1, d2, race_id):
-    p1 = get_position(d1, race_id)
-    p2 = get_position(d2, race_id)
-    if p1 is None or p2 is None:
-        return "❌ Driver not found"
-    race_name = df[df['raceId']==race_id].iloc[0]['race_name'].title()
-    if p1 < p2:
-        return f"✅ Yes — {d1.title()} (P{p1}) finished ahead of {d2.title()} (P{p2}) in {race_name}."
-    else:
-        return f"❌ No — {d2.title()} (P{p2}) finished ahead of {d1.title()} (P{p1}) in {race_name}."
-
-def winner(race_id):
-    row = df[(df['raceId']==race_id) & (df['position']==1)].iloc[0]
-    return f"Winner of {row['year']} {row['race_name'].title()}: {row['driver_name'].title()}"
-
-def podium(race_id):
-    race_df = df[df['raceId']==race_id]
-    podium_df = race_df[race_df['position'].isin([1,2,3])].sort_values('position')
-    return "🏁 Podium: " + ", ".join(f"{r['driver_name'].title()} (P{r['position']})" for _, r in podium_df.iterrows())
-
-def position_of(driver, race_id):
-    pos = get_position(driver, race_id)
-    if pos is None:
-        return f"{driver.title()}: ❌ Not found"
-    race_name = df[df['raceId']==race_id].iloc[0]['race_name'].title()
-    return f"{driver.title()} finished P{pos} in {race_name}."
-
-def position_number(pos, race_id):
-    row = df[(df['raceId']==race_id) & (df['position']==pos)]
-    if row.empty:
-        return f"❌ No driver in P{pos}"
-    return f"P{pos}: {row.iloc[0]['driver_name'].title()}"
+def query_ollama(prompt: str, race_results: pd.DataFrame, model_name="llama3:latest"):
+    """Query Ollama for a natural-language answer using race results."""
+    context = "\n".join([
+        f"{row['positionOrder']} | {row['forename']} {row['surname']} | {row['points']} points"
+        for _, row in race_results.iterrows()
+    ])
+    full_prompt = (
+        f"Use the following F1 race data to answer the question:\n\n"
+        f"DATA:\n{context}\n\n"
+        f"QUESTION:\n{prompt}\n\n"
+        "Answer factually based on the data."
+    )
+    try:
+        result = subprocess.run(
+            ["ollama", "run", model_name],
+            input=full_prompt,
+            capture_output=True,
+            text=True,
+            check=True
+        )
+        return result.stdout.strip()
+    except subprocess.CalledProcessError as e:
+        return f"❌ Error: {e.stderr.strip()}"
 
 # -----------------------------
-# DO WELL JUDGMENT
+# ✨ STREAMLIT UI
 # -----------------------------
-def do_well_judgment(driver_name, race_id):
-    pos = get_position(driver_name, race_id)
-    if pos is None:
-        return f"{driver_name.title()}: ❌ Not found in this race."
-    race_name = df[df['raceId']==race_id].iloc[0]['race_name'].title()
-    
-    if pos <= 3:
-        judgment = "Excellent — finished on the podium!"
-    elif pos <= 5:
-        judgment = "Decent — finished in top 5."
-    elif pos <= 10:
-        judgment = "Okay — finished in top 10."
-    else:
-        judgment = "Poor — finished outside top 10."
-    
-    return f"{driver_name.title()} in {race_name}? {judgment} (P{pos})"
+st.title("🏎️ F1 Chatbot — Full Race Debug")
 
-# -----------------------------
-# MEMORY / UI
-# -----------------------------
-st.header("💬 F1 Chatbot (Full Fixed + Judgment)")
+# Chat input
+prompt = st.text_input("Ask about F1 race (e.g., 'Bahrain 2021 winner'):")
 
-if "messages" not in st.session_state:
-    st.session_state.messages = []
+if prompt:
+    st.markdown(f"**User prompt:** {prompt}")
 
-if "last_race" not in st.session_state:
-    st.session_state.last_race = None
+    # -----------------------------
+    # 🔹 Get raceId
+    # -----------------------------
+    race_id, race_full_name = get_race_id(prompt)
+    if race_id is None:
+        st.error("⚠️ Could not find race matching your prompt. Check spelling or format.")
+        st.stop()
 
-# DISPLAY CHAT
-for msg in st.session_state.messages:
-    with st.chat_message(msg["role"]):
-        st.markdown(msg["content"])
+    st.markdown(f"**Retrieved raceId:** {race_id} — {race_full_name}")
 
-user_input = st.chat_input("Ask about F1...")
+    # -----------------------------
+    # 🔹 Retrieve full race results
+    # -----------------------------
+    race_results = get_full_race_results(race_id)
+    if race_results is None:
+        st.warning(f"No results found for raceId {race_id}.")
+        st.stop()
 
-# -----------------------------
-# MAIN LOGIC
-# -----------------------------
-if user_input:
-    st.session_state.messages.append({"role":"user","content":user_input})
-    with st.chat_message("user"):
-        st.markdown(user_input)
+    # -----------------------------
+    # 🔹 Show full table
+    # -----------------------------
+    display_df = format_race_results_for_display(race_results)
+    st.markdown("### Full Race Results (P1 → Last)")
+    st.dataframe(display_df)
 
-    text = user_input.lower()
-    race_id = get_race(text)
-    if race_id:
-        st.session_state.last_race = race_id
-    else:
-        race_id = st.session_state.last_race
-
-    response = None
-
-    # POSITION NUMBER
-    pos_match = re.search(r"p(\d+)|(\d+)(?:st|nd|rd|th)", text)
-    if race_id and pos_match:
-        pos = int(pos_match.group(1) or pos_match.group(2))
-        response = position_number(pos, race_id)
-
-    # WINNER
-    elif race_id and any(x in text for x in ["winner","won","first"]):
-        response = winner(race_id)
-
-    # PODIUM
-    elif race_id and "podium" in text:
-        response = podium(race_id)
-
-    # COMPARE DRIVERS
-    elif race_id and any(x in text for x in ["better","ahead","beat","faster"]):
-        drivers_found = match_drivers_in_race(text, race_id)
-        if len(drivers_found) >= 2:
-            response = compare(drivers_found[0], drivers_found[1], race_id)
-        else:
-            response = "❌ Could not detect both drivers."
-
-    # DO WELL / PERFORMANCE JUDGMENT
-    elif race_id and any(x in text for x in ["do well","good","perform","how did"]):
-        drivers_found = match_drivers_in_race(text, race_id)
-        if drivers_found:
-            response = do_well_judgment(drivers_found[0], race_id)
-        else:
-            response = "❌ Could not detect driver; generic model answer could be used here."
-
-    # POSITION OF DRIVER
-    elif race_id and any(x in text for x in ["position","place","finish"]):
-        drivers_found = match_drivers_in_race(text, race_id)
-        if drivers_found:
-            response = position_of(drivers_found[0], race_id)
-
-    if not response:
-        response = "❌ Could not match query precisely."
-
-    st.session_state.messages.append({"role":"assistant","content":response})
-    with st.chat_message("assistant"):
-        st.markdown(response)
+    # -----------------------------
+    # 🔹 Optional: LLM summary
+    # -----------------------------
+    st.markdown("### LLM Answer")
+    answer = query_ollama(prompt, race_results)
+    st.markdown(answer)
