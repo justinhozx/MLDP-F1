@@ -443,12 +443,14 @@ else:
        
 
 # ==================================================
-# F1 CHATBOT (FINAL: FLEXIBLE + STRICT + NICKNAMES)
+# F1 CHATBOT (FULL FIXED + "DO WELL" JUDGMENT")
 # ==================================================
 import streamlit as st
 import pandas as pd
 import re
-from difflib import get_close_matches
+import numpy as np
+from sentence_transformers import SentenceTransformer
+import faiss
 
 # -----------------------------
 # LOAD DATA
@@ -456,25 +458,19 @@ from difflib import get_close_matches
 results = pd.read_csv("archive/results.csv", na_values=[r"\N"])
 races = pd.read_csv("archive/races.csv", na_values=[r"\N"])
 drivers = pd.read_csv("archive/drivers.csv", na_values=[r"\N"])
-constructors = pd.read_csv("archive/constructors.csv", na_values=[r"\N"])
-status = pd.read_csv("archive/status.csv", na_values=[r"\N"])
+
+# merge for easy lookup
+df = results.merge(races, on="raceId").merge(drivers, on="driverId")
 
 # -----------------------------
-# MERGE
-# -----------------------------
-df = results.merge(races, on="raceId", how="left")
-df = df.merge(drivers, on="driverId", how="left")
-df = df.merge(constructors, on="constructorId", how="left")
-df = df.merge(status, on="statusId", how="left")
-
-# -----------------------------
-# CLEAN
+# CLEAN DATA
 # -----------------------------
 df['driver_name'] = (df['forename'] + " " + df['surname']).str.lower().str.strip()
-df['race_name'] = df['name_x'].str.lower().str.strip()
+df['race_name'] = df['name'].str.lower().str.strip()
 df['year'] = df['year'].astype(int)
-df['position_order'] = df['positionOrder'].astype(int)
+df['position'] = df['positionOrder'].astype(int)
 
+# cleaned race names for embedding
 df['race_name_norm'] = (
     df['race_name']
     .str.replace("grand prix", "", regex=False)
@@ -484,109 +480,143 @@ df['race_name_norm'] = (
 )
 
 # -----------------------------
-# DRIVER NORMALIZATION (UPGRADED)
+# MODEL
 # -----------------------------
-driver_map = {
-    "max": "max verstappen",
-    "verstappen": "max verstappen",
-    "lewis": "lewis hamilton",
-    "hamilton": "lewis hamilton",
-}
-
-def normalize_driver(name):
-    name = name.lower().strip()
-    return driver_map.get(name, name)
-
-def extract_drivers(text):
-    found = []
-    for key in driver_map.keys():
-        if re.search(rf"\b{key}\b", text):
-            found.append(driver_map[key])
-    return list(set(found))
+model = SentenceTransformer("all-MiniLM-L6-v2")
 
 # -----------------------------
-# GP MATCH
+# RACE EMBEDDINGS
 # -----------------------------
-def normalize_gp(text):
-    text = text.lower()
-    text = text.replace("grand prix", "").replace("gp", "")
-    text = re.sub(r"[^a-z\s]", "", text)
-    return text.strip()
+race_list = df[['raceId', 'race_name_norm', 'year']].drop_duplicates()
+race_texts = (race_list['year'].astype(str) + " " + race_list['race_name_norm']).tolist()
+race_emb = model.encode(race_texts, convert_to_numpy=True)
+faiss.normalize_L2(race_emb)
+race_index = faiss.IndexFlatIP(race_emb.shape[1])
+race_index.add(race_emb)
 
-def get_race_id(gp_text, year):
-    if not gp_text or not year:
+# -----------------------------
+# QUERY FUNCTIONS
+# -----------------------------
+def get_race(user_text):
+    year_match = re.search(r"\b\d{4}\b", user_text)
+    if not year_match:
         return None
+    year = int(year_match.group())
+    words = re.findall(r"[a-z]+", user_text.lower())
 
-    gp_norm = normalize_gp(gp_text)
+    candidate_races = df[['raceId', 'race_name_norm', 'year']].drop_duplicates()
+    candidate_races = candidate_races[candidate_races['year'] == year]
 
-    season_df = df[df['year'] == year]
-    race_list = season_df['race_name_norm'].unique().tolist()
+    best_score = 0
+    best_race_id = None
 
-    # exact
-    if gp_norm in race_list:
-        return season_df[season_df['race_name_norm'] == gp_norm].iloc[0]['raceId']
+    for _, row in candidate_races.iterrows():
+        race_words = row['race_name_norm'].split()
+        # sum of lengths of words that appear in user text
+        score = sum(len(w) for w in race_words if w in words)
+        if score > best_score:
+            best_score = score
+            best_race_id = row['raceId']
 
-    # fuzzy
-    match = get_close_matches(gp_norm, race_list, n=1, cutoff=0.6)
-    if match:
-        return season_df[season_df['race_name_norm'] == match[0]].iloc[0]['raceId']
+    return best_race_id
 
-    return None
+def match_drivers_in_race(text, race_id):
+    race_drivers = df[df['raceId'] == race_id]['driver_name'].unique().tolist()
+    if not race_drivers:
+        return []
+    emb = model.encode(race_drivers, convert_to_numpy=True)
+    faiss.normalize_L2(emb)
+    index = faiss.IndexFlatIP(emb.shape[1])
+    index.add(emb)
+    words = re.findall(r"[a-z]+", text.lower())
+    matches = []
+    for w in words:
+        vec = model.encode([w], convert_to_numpy=True)
+        faiss.normalize_L2(vec)
+        k = min(5, len(race_drivers))
+        D, I = index.search(vec, k)
+        for idx, score in zip(I[0], D[0]):
+            if score > 0.5:
+                matches.append(race_drivers[idx])
+    seen = set()
+    unique = []
+    for m in matches:
+        if m not in seen:
+            unique.append(m)
+            seen.add(m)
+    return unique
 
-# -----------------------------
-# QUERIES
-# -----------------------------
-def query_winner(race_id):
-    row = df[(df['raceId']==race_id) & (df['position_order']==1)].iloc[0]
-    return f"Winner of {row['year']} {row['race_name'].title()}: {row['driver_name'].title()}"
-
-def query_position(driver, race_id):
+def get_position(driver, race_id):
     row = df[(df['raceId']==race_id) & (df['driver_name']==driver)]
     if row.empty:
-        return f"{driver.title()}: ❌ Not found"
-    pos = int(row.iloc[0]['position_order'])
-    race = row.iloc[0]['race_name'].title()
-    return f"{driver.title()} finished P{pos} in {race}."
+        return None
+    return int(row.iloc[0]['position'])
 
-def query_compare(d1, d2, race_id):
-    race_df = df[df['raceId']==race_id]
-
-    r1 = race_df[race_df['driver_name']==d1]
-    r2 = race_df[race_df['driver_name']==d2]
-
-    if r1.empty or r2.empty:
+def compare(d1, d2, race_id):
+    p1 = get_position(d1, race_id)
+    p2 = get_position(d2, race_id)
+    if p1 is None or p2 is None:
         return "❌ Driver not found"
-
-    p1 = int(r1.iloc[0]['position_order'])
-    p2 = int(r2.iloc[0]['position_order'])
-
+    race_name = df[df['raceId']==race_id].iloc[0]['race_name'].title()
     if p1 < p2:
-        return f"{d1.title()} finished better than {d2.title()} (P{p1} vs P{p2})"
-    elif p2 < p1:
-        return f"{d2.title()} finished better than {d1.title()} (P{p2} vs P{p1})"
+        return f"✅ Yes — {d1.title()} (P{p1}) finished ahead of {d2.title()} (P{p2}) in {race_name}."
     else:
-        return f"{d1.title()} and {d2.title()} finished equal (P{p1})"
+        return f"❌ No — {d2.title()} (P{p2}) finished ahead of {d1.title()} (P{p1}) in {race_name}."
 
-def query_podium(race_id):
+def winner(race_id):
+    row = df[(df['raceId']==race_id) & (df['position']==1)].iloc[0]
+    return f"Winner of {row['year']} {row['race_name'].title()}: {row['driver_name'].title()}"
+
+def podium(race_id):
     race_df = df[df['raceId']==race_id]
-    podium_df = race_df[race_df['position_order'].isin([1,2,3])].sort_values('position_order')
+    podium_df = race_df[race_df['position'].isin([1,2,3])].sort_values('position')
+    return "🏁 Podium: " + ", ".join(f"{r['driver_name'].title()} (P{r['position']})" for _, r in podium_df.iterrows())
 
-    podium = [
-        f"{r['driver_name'].title()} (P{r['position_order']})"
-        for _, r in podium_df.iterrows()
-    ]
+def position_of(driver, race_id):
+    pos = get_position(driver, race_id)
+    if pos is None:
+        return f"{driver.title()}: ❌ Not found"
+    race_name = df[df['raceId']==race_id].iloc[0]['race_name'].title()
+    return f"{driver.title()} finished P{pos} in {race_name}."
 
-    race = podium_df.iloc[0]['race_name'].title()
-    return f"🏁 Podium {race}:\n" + ", ".join(podium)
+def position_number(pos, race_id):
+    row = df[(df['raceId']==race_id) & (df['position']==pos)]
+    if row.empty:
+        return f"❌ No driver in P{pos}"
+    return f"P{pos}: {row.iloc[0]['driver_name'].title()}"
 
 # -----------------------------
-# UI
+# DO WELL JUDGMENT
 # -----------------------------
-st.header("💬 F1 Chatbot (Final Smart Version)")
+def do_well_judgment(driver_name, race_id):
+    pos = get_position(driver_name, race_id)
+    if pos is None:
+        return f"{driver_name.title()}: ❌ Not found in this race."
+    race_name = df[df['raceId']==race_id].iloc[0]['race_name'].title()
+    
+    if pos <= 3:
+        judgment = "Excellent — finished on the podium!"
+    elif pos <= 5:
+        judgment = "Decent — finished in top 5."
+    elif pos <= 10:
+        judgment = "Okay — finished in top 10."
+    else:
+        judgment = "Poor — finished outside top 10."
+    
+    return f"{driver_name.title()} in {race_name}? {judgment} (P{pos})"
+
+# -----------------------------
+# MEMORY / UI
+# -----------------------------
+st.header("💬 F1 Chatbot (Full Fixed + Judgment)")
 
 if "messages" not in st.session_state:
     st.session_state.messages = []
 
+if "last_race" not in st.session_state:
+    st.session_state.last_race = None
+
+# DISPLAY CHAT
 for msg in st.session_state.messages:
     with st.chat_message(msg["role"]):
         st.markdown(msg["content"])
@@ -597,61 +627,58 @@ user_input = st.chat_input("Ask about F1...")
 # MAIN LOGIC
 # -----------------------------
 if user_input:
-
-    text = user_input.lower()
-
+    st.session_state.messages.append({"role":"user","content":user_input})
     with st.chat_message("user"):
         st.markdown(user_input)
 
-    st.session_state.messages.append({"role":"user","content":user_input})
-
-    # YEAR
-    year_match = re.search(r"\d{4}", text)
-    year = int(year_match.group()) if year_match else None
-
-    # GP
-    gp_match = re.search(r"([a-z\s]+grand prix|[a-z\s]+gp)", text)
-    gp_text = gp_match.group(1) if gp_match else ""
-
-    race_id = get_race_id(gp_text, year)
-
-    drivers_found = extract_drivers(text)
+    text = user_input.lower()
+    race_id = get_race(text)
+    if race_id:
+        st.session_state.last_race = race_id
+    else:
+        race_id = st.session_state.last_race
 
     response = None
 
-    # -------------------------
-    # PODIUM (supports: "2019 silverstone podium")
-    # -------------------------
-    if race_id and "podium" in text:
-        response = query_podium(race_id)
+    # POSITION NUMBER
+    pos_match = re.search(r"p(\d+)|(\d+)(?:st|nd|rd|th)", text)
+    if race_id and pos_match:
+        pos = int(pos_match.group(1) or pos_match.group(2))
+        response = position_number(pos, race_id)
 
-    # -------------------------
     # WINNER
-    # -------------------------
-    elif race_id and any(x in text for x in ["who won","winner"]):
-        response = query_winner(race_id)
+    elif race_id and any(x in text for x in ["winner","won","first"]):
+        response = winner(race_id)
 
-    # -------------------------
-    # POSITION (supports "what place did")
-    # -------------------------
-    elif race_id and ("place" in text or "position" in text):
-        if drivers_found:
-            response = query_position(drivers_found[0], race_id)
+    # PODIUM
+    elif race_id and "podium" in text:
+        response = podium(race_id)
 
-    # -------------------------
-    # BETTER THAN (flexible)
-    # -------------------------
-    elif race_id and ("better" in text or "ahead" in text):
+    # COMPARE DRIVERS
+    elif race_id and any(x in text for x in ["better","ahead","beat","faster"]):
+        drivers_found = match_drivers_in_race(text, race_id)
         if len(drivers_found) >= 2:
-            response = query_compare(drivers_found[0], drivers_found[1], race_id)
+            response = compare(drivers_found[0], drivers_found[1], race_id)
+        else:
+            response = "❌ Could not detect both drivers."
 
-    # -------------------------
-    # FAIL SAFE
-    # -------------------------
+    # DO WELL / PERFORMANCE JUDGMENT
+    elif race_id and any(x in text for x in ["do well","good","perform","how did"]):
+        drivers_found = match_drivers_in_race(text, race_id)
+        if drivers_found:
+            response = do_well_judgment(drivers_found[0], race_id)
+        else:
+            response = "❌ Could not detect driver; generic model answer could be used here."
+
+    # POSITION OF DRIVER
+    elif race_id and any(x in text for x in ["position","place","finish"]):
+        drivers_found = match_drivers_in_race(text, race_id)
+        if drivers_found:
+            response = position_of(drivers_found[0], race_id)
+
     if not response:
         response = "❌ Could not match query precisely."
 
+    st.session_state.messages.append({"role":"assistant","content":response})
     with st.chat_message("assistant"):
         st.markdown(response)
-
-    st.session_state.messages.append({"role":"assistant","content":response})
