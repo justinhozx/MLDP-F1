@@ -494,28 +494,22 @@ Extract ALL relevant intents from this user prompt.
 Return JSON with:
 - year (if mentioned)
 - race (if mentioned)
-- queries (ARRAY) where each query can include:
-    - driver_position (driver)
-    - fastest_lap (driver optional)
-    - podium or position_lookup (positions optional)
-    - retirements
-    - compare_drivers (drivers array)
+- driver (if mentioned)
+- action (ARRAY or string of actions like 'won', 'fastest lap', 'position')
+- extra_info (if needed)
 
 Rules:
-- Positions: winner=1, podium=1-3, top N=1..N
-- Driver names must match CSV 'driver_name' exactly if possible
-- Multiple questions → multiple queries
 - Always return JSON only, no explanation
+- Multiple questions → multiple actions in 'action' list
+- Driver names should match CSV 'driver_name' if possible
 
 Example:
 "2021 Bahrain Vettel what place and what was his fastest lap?"
 → {{
     "year":2021,
     "race":"Bahrain",
-    "queries":[
-        {{"query_type":"driver_position","driver":"Sebastian Vettel"}},
-        {{"query_type":"fastest_lap","driver":"Sebastian Vettel"}}
-    ]
+    "driver":"Sebastian Vettel",
+    "action":["driver position","fastest lap"]
 }}
 User: {prompt}
 """
@@ -553,75 +547,82 @@ def match_driver_csv(driver_input, race_results):
     return row
 
 # -----------------------------
-# EXECUTE QUERIES USING CSV
+# EXTRACT FACTS DYNAMICALLY
 # -----------------------------
-def execute_queries(parsed, race_results, original_prompt):
+def extract_facts(parsed_intent, race_results):
+    """
+    Dynamically extract relevant CSV rows for multi-action queries
+    Returns:
+        - list of CSV fact strings
+        - list of dicts for display
+    """
+    facts = []
+    display_rows = []
+
     if race_results is None:
-        return "Race not found in CSV."
+        return ["Race not found in CSV."], []
 
-    queries = parsed.get("queries", [])
-    results_list = []
+    driver = parsed_intent.get("driver")
+    actions = parsed_intent.get("action", [])
+    if isinstance(actions, str):
+        actions = [actions]  # wrap single action as list
+    year = parsed_intent.get("year")
+    race_name = parsed_intent.get("race")
 
-    for q in queries:
-        qtype = q.get("query_type")
+    for action in actions:
+        action = action.lower()
 
-        # DRIVER POSITION
-        if qtype=="driver_position":
-            driver = q.get("driver")
-            if not driver:
-                continue
+        # Winning / First place
+        if action in ["won","winner","first","victor"]:
+            winner_row = race_results[race_results['positionOrder']==1]
+            if not winner_row.empty:
+                r = winner_row.iloc[0]
+                facts.append(f"P1: {r['driver_name']} ({r['constructor_name']})")
+                display_rows.append(r.to_dict())
+
+        # Specific driver position
+        if driver and action in ["driver position","finished","position","place","result"]:
             row = match_driver_csv(driver, race_results)
-            if row.empty:
-                results_list.append(f"{driver} not found in this race.")
-            else:
+            if not row.empty:
                 r = row.iloc[0]
-                results_list.append(f"{r['driver_name']} ({r['constructor_name']}) finished P{int(r['positionOrder'])}")
+                facts.append(f"{r['driver_name']} ({r['constructor_name']}) finished P{int(r['positionOrder'])}")
+                display_rows.append(r.to_dict())
+            else:
+                facts.append(f"{driver} not found in race results.")
 
-        # FASTEST LAP
-        elif qtype=="fastest_lap":
-            driver = q.get("driver", None)
+        # Specific driver fastest lap
+        if driver and action in ["fastest lap","fastest","quickest lap"]:
             filtered = race_results.dropna(subset=["fastestLapTime"])
-            if driver:
-                row = match_driver_csv(driver, filtered)
-                if row.empty:
-                    results_list.append(f"{driver} fastest lap not found.")
-                else:
-                    r = row.iloc[0]
-                    results_list.append(f"{r['driver_name']} ({r['constructor_name']}) fastest lap: {r['fastestLapTime']} at {r['fastestLapSpeed']} km/h")
+            row = match_driver_csv(driver, filtered)
+            if not row.empty:
+                r = row.iloc[0]
+                facts.append(f"{r['driver_name']} ({r['constructor_name']}) fastest lap: {r['fastestLapTime']} at {r['fastestLapSpeed']} km/h")
+                display_rows.append(r.to_dict())
             else:
-                fastest = filtered.sort_values("fastestLapTime").iloc[0]
-                results_list.append(f"Fastest lap: {fastest['driver_name']} ({fastest['constructor_name']}) - {fastest['fastestLapTime']} at {fastest['fastestLapSpeed']} km/h")
+                facts.append(f"{driver} fastest lap not found.")
 
-        # POSITION LOOKUP / PODIUM
-        elif qtype=="position_lookup":
-            positions = q.get("positions",[1,2,3])
-            podium = race_results[race_results['positionOrder'].isin(positions)]
-            podium_text = "\n".join([f"P{int(r['positionOrder'])}: {r['driver_name']} ({r['constructor_name']})" for _,r in podium.iterrows()])
-            results_list.append(podium_text)
+        # Generic fastest lap (no driver)
+        if not driver and action in ["fastest lap","fastest","quickest lap"]:
+            filtered = race_results.dropna(subset=["fastestLapTime"])
+            if not filtered.empty:
+                r = filtered.sort_values("fastestLapTime").iloc[0]
+                facts.append(f"Fastest lap: {r['driver_name']} ({r['constructor_name']}) - {r['fastestLapTime']} at {r['fastestLapSpeed']} km/h")
+                display_rows.append(r.to_dict())
 
-        # RETIREMENTS
-        elif qtype=="retirements":
-            retired = race_results[race_results['positionText'].str.upper().isin(["R","DNF"])]
-            if retired.empty:
-                results_list.append("No retirements.")
-            else:
-                results_list.append("Retirements:\n" + "\n".join([f"{r['driver_name']} ({r['constructor_name']})" for _,r in retired.iterrows()]))
+        # Podium / top 3
+        if action in ["podium","top 3","positions","position lookup"]:
+            podium = race_results[race_results['positionOrder'].isin([1,2,3])]
+            for _, r in podium.iterrows():
+                facts.append(f"P{int(r['positionOrder'])}: {r['driver_name']} ({r['constructor_name']})")
+                display_rows.append(r.to_dict())
 
-        # COMPARE DRIVERS
-        elif qtype=="compare_drivers":
-            drivers_list = q.get("drivers",[])
-            rows = [match_driver_csv(d,race_results).iloc[0] for d in drivers_list if not match_driver_csv(d,race_results).empty]
-            if len(rows)==2:
-                d1,d2 = rows
-                if d1["positionOrder"]<d2["positionOrder"]:
-                    results_list.append(f"{d1['driver_name']} finished ahead of {d2['driver_name']}")
-                else:
-                    results_list.append(f"{d2['driver_name']} finished ahead of {d1['driver_name']}")
+    return facts, display_rows
 
-    # Combine CSV facts
-    combined_facts = "\n".join(results_list)
-
-    # LLM rewords human-readable answer from CSV facts
+# -----------------------------
+# GENERATE HUMAN-READABLE ANSWER
+# -----------------------------
+def answer_from_facts(facts, original_prompt):
+    combined_facts = "\n".join(facts)
     prompt = f"""
 You are an F1 expert.
 
@@ -658,6 +659,12 @@ if prompt:
         st.markdown(f"### Race Found: {race_name} ({year})")
         st.dataframe(race_results[['positionOrder','driver_name','constructor_name','grid','laps','time','fastestLapTime','fastestLapSpeed','positionText']])
 
-    st.markdown("### Answer")
-    answer = execute_queries(parsed, race_results, prompt)
+    # Extract CSV facts dynamically
+    facts, display_rows = extract_facts(parsed, race_results)
+    st.markdown("### CSV Facts Used / Extracted")
+    for f in facts:
+        st.write(f)
+
+    st.markdown("### Human-Readable CSV-Based Answer")
+    answer = answer_from_facts(facts, prompt)
     st.write(answer)
