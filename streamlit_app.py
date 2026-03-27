@@ -494,6 +494,47 @@ if st.checkbox("Enable filtering/search on table"):
         filtered = df[df[search_col].astype(str).str.contains(search_val, case=False, na=False)]
         st.write(f"Filtered rows: {filtered.shape[0]}")
         st.dataframe(filtered)
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 # ==================================================
 # F1 HYBRID SYSTEM — CSV EXPLORER + SMART AI CHATBOT
 # ==================================================
@@ -529,6 +570,10 @@ results = pd.read_csv("archive/results.csv", na_values=[r"\N"])
 races = pd.read_csv("archive/races.csv", na_values=[r"\N"])
 drivers = pd.read_csv("archive/drivers.csv", na_values=[r"\N"])
 constructors = pd.read_csv("archive/constructors.csv", na_values=[r"\N"])
+lap_times = pd.read_csv("archive/lap_times.csv", na_values=[r"\N"])
+pit_stops = pd.read_csv("archive/pit_stops.csv", na_values=[r"\N"])
+driver_standings = pd.read_csv("archive/driver_standings.csv", na_values=[r"\N"])
+constructor_standings = pd.read_csv("archive/constructor_standings.csv", na_values=[r"\N"])
 
 # Merge names
 results = results.merge(drivers[['driverId','forename','surname']], on='driverId', how='left')
@@ -582,16 +627,11 @@ User: {prompt}
 # NORMALIZE INTENT
 # ==================================================
 def normalize_intent(parsed):
-    # Ensure drivers list
     if "drivers" not in parsed:
         if "driver" in parsed:
-            if isinstance(parsed["driver"], list):
-                parsed["drivers"] = parsed["driver"]
-            else:
-                parsed["drivers"] = [parsed["driver"]]
+            parsed["drivers"] = parsed["driver"] if isinstance(parsed["driver"], list) else [parsed["driver"]]
         else:
             parsed["drivers"] = []
-
     return parsed
 
 # ==================================================
@@ -599,16 +639,12 @@ def normalize_intent(parsed):
 # ==================================================
 def decide_execution(parsed):
     text = json.dumps(parsed).lower()
-
     if any(k in text for k in ["ahead","compare","front","higher","between"]):
         return "comparison"
-
-    if "fastest" in text:
-        return "fastest_lap"
-
+    if "fastest" in text or "race pace" in text or "average pace" in text:
+        return "race_pace"
     if any(k in text for k in ["win","winner","p1"]):
         return "winner"
-
     return "lookup"
 
 # ==================================================
@@ -617,26 +653,18 @@ def decide_execution(parsed):
 def get_race_results(year, race_keyword):
     if not year or not race_keyword:
         return None, None
-
     race_keyword = race_keyword.lower()
-
     race_row = races[
         (races['year'] == int(year)) &
-        (
-            races['name'].str.lower().str.contains(race_keyword, na=False) |
-            races['name'].str.lower().str.replace(" grand prix", "").str.contains(race_keyword, na=False)
-        )
+        (races['name'].str.lower().str.contains(race_keyword, na=False) |
+         races['name'].str.lower().str.replace(" grand prix", "").str.contains(race_keyword, na=False))
     ]
-
     if race_row.empty:
         return None, None
-
     race_id = race_row.iloc[0]['raceId']
     race_name = race_row.iloc[0]['name']
-
     race_results = results[results['raceId'] == race_id].copy()
     race_results = race_results.sort_values("positionOrder")
-
     return race_results, race_name
 
 # ==================================================
@@ -651,67 +679,122 @@ def match_driver_csv(name, df):
 # ==================================================
 def handle_comparison(parsed, race_results):
     drivers = parsed.get("drivers", [])
-
     if len(drivers) < 2:
         return ["Not enough drivers"], []
-
     d1 = match_driver_csv(drivers[0], race_results)
     d2 = match_driver_csv(drivers[1], race_results)
-
     if d1.empty or d2.empty:
         return ["Driver not found"], []
-
     r1 = d1.iloc[0]
     r2 = d2.iloc[0]
-
     pos1 = int(r1['positionOrder'])
     pos2 = int(r2['positionOrder'])
-
     facts = [
         f"{r1['driver_name']} finished P{pos1}",
         f"{r2['driver_name']} finished P{pos2}"
     ]
-
     if pos1 < pos2:
         facts.append(f"{r1['driver_name']} finished ahead of {r2['driver_name']}")
     elif pos2 < pos1:
         facts.append(f"{r2['driver_name']} finished ahead of {r1['driver_name']}")
     else:
         facts.append("They finished in the same position")
-
     return facts, [r1.to_dict(), r2.to_dict()]
 
 # ==================================================
-# GENERAL FACT EXTRACTION
+# RACE PACE EXTRACTION
+# ==================================================
+def handle_race_pace(parsed, race_results, race_id):
+    top_drivers = []
+    if race_results is None:
+        return ["Race not found"], []
+
+    # get all laps for this race
+    race_laps = lap_times[lap_times['raceId'] == race_id].copy()
+    if race_laps.empty:
+        return ["No lap times found"], []
+
+    # calculate average lap per driver
+    driver_avg_times = race_laps.groupby('driverId')['milliseconds'].mean().reset_index()
+    driver_avg_times = driver_avg_times.merge(drivers[['driverId','forename','surname']], on='driverId', how='left')
+    driver_avg_times = driver_avg_times.merge(results[['driverId','constructor_name','raceId']], on='driverId', how='left')
+    driver_avg_times = driver_avg_times[driver_avg_times['raceId']==race_id]
+    driver_avg_times['driver_name'] = driver_avg_times['forename'].fillna('') + ' ' + driver_avg_times['surname'].fillna('')
+    driver_avg_times = driver_avg_times.sort_values('milliseconds')
+    
+    facts = []
+    display = []
+    for idx, row in driver_avg_times.iterrows():
+        pace_str = f"{row['driver_name']} ({row['constructor_name']}) - {row['milliseconds']/1000:.3f} s"
+        facts.append(pace_str)
+        display.append(row.to_dict())
+    return facts, display
+
+# ==================================================
+# GENERAL FACT EXTRACTION (MULTI-CVS)
 # ==================================================
 def extract_facts(parsed, race_results, mode):
     facts = []
     display = []
+    csv_debug = []
 
-    if race_results is None:
-        return ["Race not found"], []
-
-    if mode == "winner":
+    if race_results is not None:
+        csv_debug.append('results.csv')
+    if mode == "winner" and race_results is not None:
         r = race_results[race_results['positionOrder']==1].iloc[0]
         facts.append(f"Winner: {r['driver_name']} ({r['constructor_name']})")
         display.append(r.to_dict())
 
-    elif mode == "fastest_lap":
-        df = race_results.dropna(subset=["fastestLapTime"])
-        if not df.empty:
-            r = df.sort_values("fastestLapTime").iloc[0]
-            facts.append(f"Fastest lap: {r['driver_name']} - {r['fastestLapTime']}")
-            display.append(r.to_dict())
+    # Lap times for specific driver
+    if "drivers" in parsed and race_results is not None:
+        driver_name = parsed['drivers'][0]
+        d = match_driver_csv(driver_name, race_results)
+        if not d.empty:
+            driver_id = d.iloc[0]['driverId']
+            race_id = d.iloc[0]['raceId']
+            # lap times
+            driver_laps = lap_times[(lap_times['raceId']==race_id)&(lap_times['driverId']==driver_id)]
+            if not driver_laps.empty:
+                csv_debug.append('lap_times.csv')
+                # If user wants lap 20 specifically, include it
+                if "lap" in parsed['intent_description'].lower():
+                    lap_num = [int(s) for s in parsed['intent_description'].split() if s.isdigit()]
+                    if lap_num:
+                        lap_row = driver_laps[driver_laps['lap']==lap_num[0]]
+                        if not lap_row.empty:
+                            facts.append(f"Lap {lap_num[0]} time: {lap_row.iloc[0]['time']}")
+                # full average pace
+                avg_time = driver_laps['milliseconds'].mean()
+                facts.append(f"{driver_name}'s average lap time: {avg_time/1000:.3f} s")
+                display.append(driver_laps.to_dict('records'))
+            # pit stops
+            driver_pits = pit_stops[(pit_stops['raceId']==race_id)&(pit_stops['driverId']==driver_id)]
+            if not driver_pits.empty:
+                csv_debug.append('pit_stops.csv')
+                for idx2, pit in driver_pits.iterrows():
+                    facts.append(f"Pit stop lap {pit['lap']} - duration {pit['duration']} s")
+                display.append(driver_pits.to_dict('records'))
 
-    else:  # lookup
-        for d in parsed.get("drivers", []):
-            row = match_driver_csv(d, race_results)
-            if not row.empty:
-                r = row.iloc[0]
-                facts.append(f"{r['driver_name']} finished P{int(r['positionOrder'])}")
-                display.append(r.to_dict())
+    # Driver championship
+    season_year = parsed.get('year')
+    champ_driver = driver_standings[driver_standings['raceId']==race_results['raceId'].max()] if season_year else driver_standings
+    if not champ_driver.empty:
+        csv_debug.append('driver_standings.csv')
+        champ_row = champ_driver.sort_values('points', ascending=False).iloc[0]
+        driver_info = drivers[drivers['driverId']==champ_row['driverId']].iloc[0]
+        facts.append(f"Driver Champion {season_year}: {driver_info['forename']} {driver_info['surname']}")
+        display.append(champ_row.to_dict())
 
-    return facts, display
+    # Constructor championship
+    champ_constructor = constructor_standings[constructor_standings['raceId']==race_results['raceId'].max()] if season_year else constructor_standings
+    if not champ_constructor.empty:
+        csv_debug.append('constructor_standings.csv')
+        champ_row = champ_constructor.sort_values('points', ascending=False).iloc[0]
+        constructor_info = constructors[constructors['constructorId']==champ_row['constructorId']].iloc[0]
+        facts.append(f"Constructor Champion {season_year}: {constructor_info['name']}")
+        display.append(champ_row.to_dict())
+
+    return facts, display, csv_debug
 
 # ==================================================
 # FINAL ANSWER GENERATION
@@ -734,45 +817,39 @@ st.title("F1 Hybrid AI — CSV + Smart Chatbot")
 # ---------------- CSV EXPLORER ----------------
 st.sidebar.header("CSV Explorer")
 table_name = st.sidebar.selectbox("Select Table:", list(csv_files.keys()))
-
 csv_path = csv_files[table_name]
 if os.path.exists(csv_path):
     df = pd.read_csv(csv_path, na_values=[r"\N"])
     st.sidebar.write(f"{df.shape[0]} rows")
-
     if st.sidebar.checkbox("Show Table"):
         st.dataframe(df)
 
 # ---------------- CHATBOT ----------------
 st.header("Ask F1 Questions")
-
 prompt = st.text_input("Enter your question:")
-
 if prompt:
     parsed = normalize_intent(interpret_query(prompt))
     mode = decide_execution(parsed)
-
     st.subheader("Parsed Intent")
     st.json(parsed)
-
     st.subheader("Execution Mode")
     st.write(mode)
-
     race_results, race_name = get_race_results(parsed.get("year"), parsed.get("race"))
-
     if race_results is not None:
         st.subheader(f"{race_name} ({parsed.get('year')})")
         st.dataframe(race_results[['positionOrder','driver_name','constructor_name']])
-
-    # Execute
     if mode == "comparison":
         facts, display = handle_comparison(parsed, race_results)
+        csv_debug = ['results.csv']
+    elif mode == "race_pace":
+        facts, display = handle_race_pace(parsed, race_results, race_results.iloc[0]['raceId'])
+        csv_debug = ['results.csv','lap_times.csv','drivers.csv','constructors.csv']
     else:
-        facts, display = extract_facts(parsed, race_results, mode)
-
+        facts, display, csv_debug = extract_facts(parsed, race_results, mode)
     st.subheader("Facts Used")
     for f in facts:
         st.write(f)
-
+    st.subheader("CSV Tables Accessed (Debug Mode)")
+    st.write(csv_debug)
     st.subheader("Final Answer")
     st.write(answer_from_facts(facts, prompt))
