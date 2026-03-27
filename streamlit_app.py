@@ -440,7 +440,60 @@ else:
             "What-if Team": str(constructor_name),
             "Predicted Finish": f"P{w_pred_pos}",
         })
-       
+# ==================================================
+# F1 CSV Explorer — Display All F1 Tables
+# ==================================================
+
+import streamlit as st
+import pandas as pd
+import os
+
+# -----------------------------
+# CSV FILES
+# -----------------------------
+csv_files = {
+    "Status": "archive/status.csv",
+    "Sprint Results": "archive/sprint_results.csv",
+    "Seasons": "archive/seasons.csv",
+    "Race Results": "archive/results.csv",
+    "Races": "archive/races.csv",
+    "Qualifying": "archive/qualifying.csv",
+    "Pit Stops": "archive/pit_stops.csv",
+    "Lap Times": "archive/lap_times.csv",
+    "Drivers": "archive/drivers.csv",
+    "Driver Standings": "archive/driver_standings.csv",
+    "Constructors": "archive/constructors.csv",
+    "Constructor Standings": "archive/constructor_standings.csv",
+    "Constructor Results": "archive/constructor_results.csv",
+    "Circuits": "archive/circuits.csv"
+}
+
+# -----------------------------
+# STREAMLIT UI
+# -----------------------------
+st.title("F1 CSV Explorer — All Tables")
+
+# Sidebar for table selection
+table_name = st.sidebar.selectbox("Select CSV Table to View:", list(csv_files.keys()))
+
+# Load selected CSV
+csv_path = csv_files[table_name]
+if not os.path.exists(csv_path):
+    st.error(f"CSV file not found: {csv_path}")
+else:
+    df = pd.read_csv(csv_path, na_values=[r"\N"])
+    st.markdown(f"### Table: {table_name}")
+    st.write(f"Shape: {df.shape[0]} rows × {df.shape[1]} columns")
+    st.dataframe(df)
+
+# Optionally, allow search/filter
+if st.checkbox("Enable filtering/search on table"):
+    search_col = st.selectbox("Column to search:", df.columns)
+    search_val = st.text_input("Value to search for:")
+    if search_val:
+        filtered = df[df[search_col].astype(str).str.contains(search_val, case=False, na=False)]
+        st.write(f"Filtered rows: {filtered.shape[0]}")
+        st.dataframe(filtered)
 # ==================================================
 # F1 Chatbot — FULL CSV-DRIVEN DYNAMIC HYBRID AI
 # ==================================================
