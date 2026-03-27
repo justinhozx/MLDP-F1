@@ -441,9 +441,8 @@ else:
             "Predicted Finish": f"P{w_pred_pos}",
         })
        
-
 # ==================================================
-# F1 Chatbot — FINAL TRUE HYBRID AI (CSV-DRIVEN + HUMAN-READABLE)
+# F1 Chatbot — FULL CSV-DRIVEN DYNAMIC HYBRID AI
 # ==================================================
 
 import streamlit as st
@@ -461,24 +460,14 @@ constructors = pd.read_csv("archive/constructors.csv", na_values=[r"\N"])
 driver_standings = pd.read_csv("archive/driver_standings.csv", na_values=[r"\N"])
 constructor_standings = pd.read_csv("archive/constructor_standings.csv", na_values=[r"\N"])
 
-# -----------------------------
-# MERGE HUMAN-READABLE NAMES
-# -----------------------------
-# Results: merge driver and constructor names
-results = results.merge(
-    drivers[['driverId', 'forename', 'surname']],
-    on='driverId', how='left'
-)
+# Merge human-readable names
+results = results.merge(drivers[['driverId','forename','surname']], on='driverId', how='left')
 results['driver_name'] = results['forename'].str.strip() + " " + results['surname'].str.strip()
-
-results = results.merge(
-    constructors[['constructorId', 'name']],
-    on='constructorId', how='left'
-)
-results = results.rename(columns={"name": "constructor_name"})
+results = results.merge(constructors[['constructorId','name']], on='constructorId', how='left')
+results = results.rename(columns={"name":"constructor_name"})
 
 # -----------------------------
-# LLM CALL
+# CALL LLM
 # -----------------------------
 def call_llm(prompt, model="llama3:latest"):
     try:
@@ -491,49 +480,43 @@ def call_llm(prompt, model="llama3:latest"):
         )
         return result.stdout.strip()
     except:
-        return ""
+        return "LLM call failed."
 
 # -----------------------------
-# MULTI-INTENT PARSER (via LLM)
+# LLM-BASED QUERY PARSER
 # -----------------------------
 def interpret_query(prompt):
     system_prompt = f"""
 You are an F1 query parser.
 
-Extract ALL intents from this user prompt.
+Extract ALL relevant intents from this user prompt.
 
-Return JSON:
-- year
-- race
-- queries (ARRAY)
-
-Each query can be:
-- position_lookup (positions / driver)
-- driver_position (driver)
-- compare_drivers (drivers)
-- fastest_lap
-- retirements
-- season_champion
+Return JSON with:
+- year (if mentioned)
+- race (if mentioned)
+- queries (ARRAY) where each query can include:
+    - driver_position (driver)
+    - fastest_lap (driver optional)
+    - podium or position_lookup (positions optional)
+    - retirements
+    - compare_drivers (drivers array)
 
 Rules:
-- podium → positions [1,2,3]
-- fastest lap → fastest_lap
-- multiple questions → multiple queries
-- ALWAYS return FULL driver names from CSV
+- Positions: winner=1, podium=1-3, top N=1..N
+- Driver names must match CSV 'driver_name' exactly if possible
+- Multiple questions → multiple queries
+- Always return JSON only, no explanation
 
 Example:
-"2021 Monaco podium and fastest lap"
+"2021 Bahrain Vettel what place and what was his fastest lap?"
 → {{
-  "year":2021,
-  "race":"monaco",
-  "queries":[
-    {{"query_type":"position_lookup","positions":[1,2,3]}},
-    {{"query_type":"fastest_lap"}}
-  ]
+    "year":2021,
+    "race":"Bahrain",
+    "queries":[
+        {{"query_type":"driver_position","driver":"Sebastian Vettel"}},
+        {{"query_type":"fastest_lap","driver":"Sebastian Vettel"}}
+    ]
 }}
-
-ONLY return JSON.
-
 User: {prompt}
 """
     output = call_llm(system_prompt)
@@ -542,140 +525,120 @@ User: {prompt}
         end = output.rfind("}") + 1
         return json.loads(output[start:end])
     except:
-        return {"error": "parse failed", "raw": output}
+        return {"error":"parse failed", "raw":output}
 
 # -----------------------------
-# GET RACE RESULTS (HUMAN-READABLE)
+# GET RACE RESULTS
 # -----------------------------
 def get_race_results(year, race_keyword):
     if not race_keyword:
         return None, None
-
-    race_row = races[
-        (races['year'] == int(year)) &
-        (races['name'].str.lower().str.contains(race_keyword.lower(), regex=False))
-    ]
+    race_row = races[(races['year']==int(year)) & (races['name'].str.lower().str.contains(race_keyword.lower(), regex=False))]
     if race_row.empty:
         return None, None
-
     race_id = race_row.iloc[0]['raceId']
     race_name = race_row.iloc[0]['name']
-
-    race_results = results[results['raceId'] == race_id].copy()
+    race_results = results[results['raceId']==race_id].copy()
     race_results = race_results.sort_values("positionOrder")
-
     return race_results, race_name
 
 # -----------------------------
-# DRIVER MATCH (EXACT / CSV-VERIFIED)
+# DRIVER MATCHING
 # -----------------------------
 def match_driver_csv(driver_input, race_results):
-    # exact match first
-    row = race_results[race_results['driver_name'].str.lower() == driver_input.lower()]
+    row = race_results[race_results['driver_name'].str.lower()==driver_input.lower()]
     if not row.empty:
         return row
-    # partial match fallback
     row = race_results[race_results['driver_name'].str.contains(driver_input, case=False, regex=False)]
     return row
 
 # -----------------------------
-# QUERY EXECUTION (CSV-ONLY)
+# EXECUTE QUERIES USING CSV
 # -----------------------------
 def execute_queries(parsed, race_results, original_prompt):
-    queries = parsed.get("queries", [])
     if race_results is None:
         return "Race not found in CSV."
 
+    queries = parsed.get("queries", [])
     results_list = []
 
     for q in queries:
         qtype = q.get("query_type")
 
-        # PODIUM
-        if qtype == "position_lookup":
-            positions = q.get("positions", [1])
-            driver = q.get("driver", None)
-            if driver:
-                row = match_driver_csv(driver, race_results)
-                if not row.empty:
-                    pos = int(row.iloc[0]['positionOrder'])
-                    constructor = row.iloc[0]['constructor_name']
-                    results_list.append(f"{driver} finished P{pos} ({constructor})")
-                else:
-                    results_list.append(f"{driver} not found in race results.")
-            else:
-                podium = race_results[race_results['positionOrder'].isin(positions)]
-                podium_text = "\n".join([
-                    f"P{int(r['positionOrder'])}: {r['driver_name']} ({r['constructor_name']})"
-                    for _, r in podium.iterrows()
-                ])
-                results_list.append(podium_text)
-
         # DRIVER POSITION
-        elif qtype == "driver_position":
-            driver = q.get("driver", "")
+        if qtype=="driver_position":
+            driver = q.get("driver")
+            if not driver:
+                continue
             row = match_driver_csv(driver, race_results)
             if row.empty:
-                results_list.append(f"{driver} not found.")
+                results_list.append(f"{driver} not found in this race.")
             else:
                 r = row.iloc[0]
                 results_list.append(f"{r['driver_name']} ({r['constructor_name']}) finished P{int(r['positionOrder'])}")
 
-        # COMPARE DRIVERS
-        elif qtype == "compare_drivers":
-            drivers_list = q.get("drivers", [])
-            rows = [match_driver_csv(d, race_results).iloc[0] for d in drivers_list if not match_driver_csv(d, race_results).empty]
-            if len(rows) == 2:
-                d1, d2 = rows
-                if d1["positionOrder"] < d2["positionOrder"]:
-                    results_list.append(f"{d1['driver_name']} finished ahead of {d2['driver_name']}")
-                else:
-                    results_list.append(f"{d2['driver_name']} finished ahead of {d1['driver_name']}")
-
         # FASTEST LAP
-        elif qtype == "fastest_lap":
-            fastest = race_results.dropna(subset=["fastestLapTime"]).sort_values("fastestLapTime").head(1)
-            if fastest.empty:
-                results_list.append("Fastest lap data not available.")
+        elif qtype=="fastest_lap":
+            driver = q.get("driver", None)
+            filtered = race_results.dropna(subset=["fastestLapTime"])
+            if driver:
+                row = match_driver_csv(driver, filtered)
+                if row.empty:
+                    results_list.append(f"{driver} fastest lap not found.")
+                else:
+                    r = row.iloc[0]
+                    results_list.append(f"{r['driver_name']} ({r['constructor_name']}) fastest lap: {r['fastestLapTime']} at {r['fastestLapSpeed']} km/h")
             else:
-                r = fastest.iloc[0]
-                results_list.append(
-                    f"Fastest lap: {r['driver_name']} ({r['constructor_name']}) - {r['fastestLapTime']} at {r['fastestLapSpeed']} km/h"
-                )
+                fastest = filtered.sort_values("fastestLapTime").iloc[0]
+                results_list.append(f"Fastest lap: {fastest['driver_name']} ({fastest['constructor_name']}) - {fastest['fastestLapTime']} at {fastest['fastestLapSpeed']} km/h")
+
+        # POSITION LOOKUP / PODIUM
+        elif qtype=="position_lookup":
+            positions = q.get("positions",[1,2,3])
+            podium = race_results[race_results['positionOrder'].isin(positions)]
+            podium_text = "\n".join([f"P{int(r['positionOrder'])}: {r['driver_name']} ({r['constructor_name']})" for _,r in podium.iterrows()])
+            results_list.append(podium_text)
 
         # RETIREMENTS
-        elif qtype == "retirements":
+        elif qtype=="retirements":
             retired = race_results[race_results['positionText'].str.upper().isin(["R","DNF"])]
             if retired.empty:
                 results_list.append("No retirements.")
             else:
-                results_list.append(
-                    "Retirements:\n" + "\n".join([
-                        f"{r['driver_name']} ({r['constructor_name']})"
-                        for _, r in retired.iterrows()
-                    ])
-                )
+                results_list.append("Retirements:\n" + "\n".join([f"{r['driver_name']} ({r['constructor_name']})" for _,r in retired.iterrows()]))
 
-    combined_facts = "\n\n".join(results_list)
+        # COMPARE DRIVERS
+        elif qtype=="compare_drivers":
+            drivers_list = q.get("drivers",[])
+            rows = [match_driver_csv(d,race_results).iloc[0] for d in drivers_list if not match_driver_csv(d,race_results).empty]
+            if len(rows)==2:
+                d1,d2 = rows
+                if d1["positionOrder"]<d2["positionOrder"]:
+                    results_list.append(f"{d1['driver_name']} finished ahead of {d2['driver_name']}")
+                else:
+                    results_list.append(f"{d2['driver_name']} finished ahead of {d1['driver_name']}")
 
-    # Generate human-readable answer using LLM but only with CSV facts
+    # Combine CSV facts
+    combined_facts = "\n".join(results_list)
+
+    # LLM rewords human-readable answer from CSV facts
     prompt = f"""
 You are an F1 expert.
 
 User question:
 {original_prompt}
 
-Facts from CSV:
+Facts extracted from CSV:
 {combined_facts}
 
-Answer using ONLY these facts, do NOT hallucinate.
+Answer in human-readable text using ONLY these facts. DO NOT HALLUCINATE.
 """
     return call_llm(prompt)
 
 # -----------------------------
 # STREAMLIT UI
 # -----------------------------
-st.title("F1 Chatbot — CSV-Verified Hybrid AI")
+st.title("F1 Chatbot — True CSV-Verified Hybrid AI")
 
 prompt = st.text_input("Ask anything about F1:")
 
@@ -689,12 +652,11 @@ if prompt:
 
     year = parsed.get("year")
     race = parsed.get("race")
-
     race_results, race_name = get_race_results(year, race) if race else (None, None)
 
     if race_results is not None:
         st.markdown(f"### Race Found: {race_name} ({year})")
-        st.dataframe(race_results[['positionOrder','driver_name','constructor_name','grid','laps','time','fastestLapTime','fastestLapSpeed']])
+        st.dataframe(race_results[['positionOrder','driver_name','constructor_name','grid','laps','time','fastestLapTime','fastestLapSpeed','positionText']])
 
     st.markdown("### Answer")
     answer = execute_queries(parsed, race_results, prompt)
