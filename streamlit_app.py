@@ -534,7 +534,6 @@ if st.checkbox("Enable filtering/search on table"):
 
 
 
-
 # ==================================================
 # F1 HYBRID SYSTEM — CSV EXPLORER + SMART AI CHATBOT
 # ==================================================
@@ -544,6 +543,7 @@ import pandas as pd
 import subprocess
 import json
 import os
+import re
 
 # ==================================================
 # LOAD CSV FILES
@@ -651,7 +651,7 @@ def get_race_results(year, race_keyword):
         return None, None
     race_keyword = race_keyword.lower()
     race_row = races[
-        (races['year'] == int(year)) &
+        (races['year'] == int(year)) & 
         (races['name'].str.lower().str.contains(race_keyword, na=False) |
          races['name'].str.lower().str.replace(" grand prix", "").str.contains(race_keyword, na=False))
     ]
@@ -668,7 +668,6 @@ def get_race_results(year, race_keyword):
 # ==================================================
 def match_driver_csv(name, df):
     name = name.lower()
-    # simple fuzzy match: check driver_name contains most letters
     df['match_score'] = df['driver_name'].apply(lambda x: sum(c1==c2 for c1,c2 in zip(x.lower(),name)))
     best = df[df['match_score']==df['match_score'].max()]
     return best.drop(columns=['match_score'])
@@ -684,7 +683,7 @@ def extract_facts(parsed, race_results, mode):
     if race_results is not None:
         csv_debug.append("results.csv")
 
-    # ---- Always include driver finishing position ----
+    # ---- Driver finishing position ----
     if parsed.get("drivers") and race_results is not None:
         driver_name = parsed["drivers"][0]
         driver_row = match_driver_csv(driver_name, race_results)
@@ -701,21 +700,21 @@ def extract_facts(parsed, race_results, mode):
             race_id = driver_row.iloc[0]['raceId']
 
             # Lap times
-            driver_laps = lap_times[(lap_times['raceId']==race_id)&(lap_times['driverId']==driver_id)]
+            driver_laps = lap_times[(lap_times['raceId']==race_id) & (lap_times['driverId']==driver_id)]
             if not driver_laps.empty:
                 csv_debug.append("lap_times.csv")
                 avg_time = driver_laps['milliseconds'].mean()
                 facts.append(f"{driver_name}'s average lap time: {avg_time/1000:.3f} s")
-                # Lap 20 if requested
-                if "lap" in parsed['intent_description'].lower():
-                    lap_num = [int(s) for s in parsed['intent_description'].split() if s.isdigit()]
-                    if lap_num:
-                        lap_row = driver_laps[driver_laps['lap']==lap_num[0]]
-                        if not lap_row.empty:
-                            facts.append(f"Lap {lap_num[0]} time: {lap_row.iloc[0]['time']}")
+
+                # Extract all lap numbers from intent description
+                lap_nums = [int(s) for s in re.findall(r'\b\d+\b', parsed['intent_description'])]
+                for lap in lap_nums:
+                    lap_row = driver_laps[driver_laps['lap']==lap]
+                    if not lap_row.empty:
+                        facts.append(f"Lap {lap} time: {lap_row.iloc[0]['time']}")
 
             # Pit stops
-            driver_pits = pit_stops[(pit_stops['raceId']==race_id)&(pit_stops['driverId']==driver_id)]
+            driver_pits = pit_stops[(pit_stops['raceId']==race_id) & (pit_stops['driverId']==driver_id)]
             if not driver_pits.empty:
                 csv_debug.append("pit_stops.csv")
                 for idx, pit in driver_pits.iterrows():
