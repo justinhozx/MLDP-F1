@@ -494,8 +494,46 @@ if st.checkbox("Enable filtering/search on table"):
         filtered = df[df[search_col].astype(str).str.contains(search_val, case=False, na=False)]
         st.write(f"Filtered rows: {filtered.shape[0]}")
         st.dataframe(filtered)
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 # ==================================================
-# F1 HYBRID SYSTEM — FINAL (SMART + ROBUST + FULL TABLE)
+# F1 HYBRID SYSTEM — FINAL MULTI-CSV DEBUG (STREAMLIT)
 # ==================================================
 
 import streamlit as st
@@ -532,11 +570,9 @@ races = pd.read_csv("archive/races.csv", na_values=[r"\N"])
 drivers = pd.read_csv("archive/drivers.csv", na_values=[r"\N"])
 constructors = pd.read_csv("archive/constructors.csv", na_values=[r"\N"])
 
-# Merge names
+# Merge names for convenience
 results = results.merge(drivers[['driverId','forename','surname']], on='driverId', how='left')
-results['driver_name'] = results['forename'].fillna('') + " " + results['surname'].fillna('')
-results['driver_name'] = results['driver_name'].str.strip()
-
+results['driver_name'] = (results['forename'].fillna('') + " " + results['surname'].fillna('')).str.strip()
 results = results.merge(constructors[['constructorId','name']], on='constructorId', how='left')
 results = results.rename(columns={"name":"constructor_name"})
 
@@ -557,7 +593,7 @@ def call_llm(prompt, model="llama3:latest"):
         return ""
 
 # ==================================================
-# INTERPRET QUERY (FREE FORM)
+# INTERPRET QUERY
 # ==================================================
 def interpret_query(prompt):
     system_prompt = f"""
@@ -572,7 +608,6 @@ Return JSON ONLY with:
 User: {prompt}
 """
     output = call_llm(system_prompt)
-
     try:
         start = output.find("{")
         end = output.rfind("}") + 1
@@ -595,28 +630,25 @@ def normalize_intent(parsed):
     return parsed
 
 # ==================================================
-# DECIDE EXECUTION (USES PROMPT + PARSED)
+# DECIDE EXECUTION MODES
 # ==================================================
 def decide_execution(parsed, prompt):
     text = (json.dumps(parsed) + " " + prompt).lower()
-
     modes = []
 
     if any(k in text for k in ["ahead","compare","front","higher","between"]):
         modes.append("comparison")
-
-    if any(k in text for k in ["fastest","fastest lap","quickest"]):
+    if any(k in text for k in ["fastest","fastest lap","quickest","lap time"]):
         modes.append("fastest_lap")
-
     if any(k in text for k in ["win","winner","p1"]):
         modes.append("winner")
-
     if any(k in text for k in ["podium","top 3"]):
         modes.append("podium")
+    if any(k in text for k in ["pit stop","pitstops","pit"]):
+        modes.append("pit_stop")
 
     if not modes:
         modes.append("lookup")
-
     return list(set(modes))
 
 # ==================================================
@@ -625,9 +657,7 @@ def decide_execution(parsed, prompt):
 def get_race_results(year, race_keyword):
     if not year or not race_keyword:
         return None, None
-
     race_keyword = race_keyword.lower()
-
     race_row = races[
         (races['year'] == int(year)) &
         (
@@ -635,16 +665,12 @@ def get_race_results(year, race_keyword):
             races['name'].str.lower().str.replace(" grand prix", "").str.contains(race_keyword, na=False)
         )
     ]
-
     if race_row.empty:
         return None, None
-
     race_id = race_row.iloc[0]['raceId']
     race_name = race_row.iloc[0]['name']
-
     race_results = results[results['raceId'] == race_id].copy()
     race_results = race_results.sort_values("positionOrder")
-
     return race_results, race_name
 
 # ==================================================
@@ -655,77 +681,122 @@ def match_driver_csv(name, df):
     return df[df['driver_name'].str.lower().apply(lambda x: name in x)]
 
 # ==================================================
-# COMPARISON ENGINE
+# CSV INTENT MAP
 # ==================================================
-def handle_comparison(parsed, race_results):
-    drivers = parsed.get("drivers", [])
+csv_intent_map = {
+    "results.csv": ["position","finishing","podium","winner","compare","ahead","behind"],
+    "lap_times.csv": ["fastest lap","pace","lap","lap time","lap_times"],
+    "pit_stops.csv": ["pit stop","pitstops","pit strategy","pit"],
+    "qualifying.csv": ["qualifying","grid","q1","q2","q3"],
+    "driver_standings.csv": ["standings","driver championship","points","rank"],
+    "constructor_standings.csv": ["constructor championship","constructor standings","constructor points"],
+    "constructors.csv": ["constructor info","constructor"],
+    "circuits.csv": ["circuit","track","venue"],
+    "seasons.csv": ["season","year"],
+    "sprint_results.csv": ["sprint","sprint race"],
+    "status.csv": ["dnf","status","retired"],
+    "constructor_results.csv": ["constructor result","constructor race"]
+}
 
-    if len(drivers) < 2:
-        return ["Not enough drivers"], []
+def get_relevant_csvs(prompt):
+    prompt_lower = prompt.lower()
+    relevant = []
+    for csv_file, keywords in csv_intent_map.items():
+        if any(k in prompt_lower for k in keywords):
+            relevant.append(csv_file)
+    if "results.csv" not in relevant:
+        relevant.insert(0, "results.csv")
+    return relevant
 
-    d1 = match_driver_csv(drivers[0], race_results)
-    d2 = match_driver_csv(drivers[1], race_results)
+# ==================================================
+# LOAD FILTERED CSVS
+# ==================================================
+def load_csvs_for_driver_race(driver_name, year, race_keyword):
+    relevant_files = get_relevant_csvs(prompt)
+    loaded_tables = {}
 
-    if d1.empty or d2.empty:
-        return ["Driver not found"], []
+    race_results, race_name = get_race_results(year, race_keyword)
+    if race_results is None:
+        return {}, None
 
-    r1 = d1.iloc[0]
-    r2 = d2.iloc[0]
-
-    pos1 = int(r1['positionOrder'])
-    pos2 = int(r2['positionOrder'])
-
-    facts = [
-        f"{r1['driver_name']} finished P{pos1}",
-        f"{r2['driver_name']} finished P{pos2}"
-    ]
-
-    if pos1 < pos2:
-        facts.append(f"{r1['driver_name']} finished ahead of {r2['driver_name']}")
-    elif pos2 < pos1:
-        facts.append(f"{r2['driver_name']} finished ahead of {r1['driver_name']}")
-    else:
-        facts.append("They finished in the same position")
-
-    return facts, [r1.to_dict(), r2.to_dict()]
+    for file in relevant_files:
+        path = f"archive/{file}"
+        if os.path.exists(path):
+            df = pd.read_csv(path, na_values=[r"\N"])
+            # Filter driver/race specific data if possible
+            if "driver" in file:
+                if driver_name:
+                    df = df[df.apply(lambda x: driver_name.lower() in str(x).lower(), axis=1)]
+            if "raceId" in df.columns:
+                race_row = races[
+                    (races['year'] == int(year)) &
+                    (races['name'].str.lower().str.contains(race_keyword, na=False))
+                ]
+                if not race_row.empty:
+                    df = df[df['raceId'] == race_row.iloc[0]['raceId']]
+            loaded_tables[file] = df
+    return loaded_tables, race_name
 
 # ==================================================
 # FACT EXTRACTION
 # ==================================================
-def extract_facts(parsed, race_results, mode):
+def extract_facts(parsed, race_results, race_name, mode):
     facts = []
-    display = []
+    display_results = pd.DataFrame()
+    display_laps = pd.DataFrame()
 
     if race_results is None:
-        return ["Race not found"], []
+        return ["Race not found"], pd.DataFrame(), pd.DataFrame()
+
+    race_id = races[races['name'] == race_name].iloc[0]['raceId']
+    drivers_list = parsed.get("drivers", [])
 
     if mode == "winner":
         r = race_results[race_results['positionOrder'] == 1].iloc[0]
         facts.append(f"Winner: {r['driver_name']} ({r['constructor_name']})")
-        display.append(r.to_dict())
+        display_results, display_laps = load_csvs_for_driver_race(r['driver_name'], parsed.get("year"), parsed.get("race"))
 
     elif mode == "fastest_lap":
         df = race_results.dropna(subset=["fastestLapTime"])
         if not df.empty:
             r = df.sort_values("fastestLapTime").iloc[0]
             facts.append(f"Fastest lap: {r['driver_name']} - {r['fastestLapTime']}")
-            display.append(r.to_dict())
+            display_results, display_laps = load_csvs_for_driver_race(r['driver_name'], parsed.get("year"), parsed.get("race"))
 
     elif mode == "podium":
         podium = race_results[race_results['positionOrder'].isin([1,2,3])]
         for _, r in podium.iterrows():
             facts.append(f"P{int(r['positionOrder'])}: {r['driver_name']} ({r['constructor_name']})")
-            display.append(r.to_dict())
+        display_results, display_laps = load_csvs_for_driver_race(None, parsed.get("year"), parsed.get("race"))
 
-    else:  # lookup
-        for d in parsed.get("drivers", []):
+    elif mode == "comparison":
+        if len(drivers_list) < 2:
+            facts.append("Not enough drivers for comparison")
+        else:
+            for d in drivers_list:
+                row = match_driver_csv(d, race_results)
+                if not row.empty:
+                    r = row.iloc[0]
+                    facts.append(f"{r['driver_name']} finished P{int(r['positionOrder'])}")
+            display_results, display_laps = load_csvs_for_driver_race(drivers_list[0], parsed.get("year"), parsed.get("race"))
+
+    elif mode == "pit_stop":
+        # show pit stops table
+        for d in drivers_list:
+            facts.append(f"Pit stops info for {d}")
+        display_results, display_laps = load_csvs_for_driver_race(drivers_list[0] if drivers_list else None,
+                                                                  parsed.get("year"), parsed.get("race"))
+
+    else:  # lookup / position query
+        for d in drivers_list:
             row = match_driver_csv(d, race_results)
             if not row.empty:
                 r = row.iloc[0]
                 facts.append(f"{r['driver_name']} finished P{int(r['positionOrder'])}")
-                display.append(r.to_dict())
+        display_results, display_laps = load_csvs_for_driver_race(drivers_list[0] if drivers_list else None,
+                                                                  parsed.get("year"), parsed.get("race"))
 
-    return facts, display
+    return facts, display_results, display_laps
 
 # ==================================================
 # FINAL ANSWER
@@ -743,23 +814,20 @@ Answer naturally using ONLY these facts.
 # ==================================================
 # STREAMLIT UI
 # ==================================================
-st.title("F1 Hybrid AI — Final Smart System")
+st.title("F1 Hybrid AI — Multi-CSV Debug System")
 
 # -------- CSV EXPLORER --------
 st.sidebar.header("CSV Explorer")
 table_name = st.sidebar.selectbox("Select Table:", list(csv_files.keys()))
-
 csv_path = csv_files[table_name]
 if os.path.exists(csv_path):
     df = pd.read_csv(csv_path, na_values=[r"\N"])
     st.sidebar.write(f"{df.shape[0]} rows")
-
     if st.sidebar.checkbox("Show Table"):
         st.dataframe(df)
 
 # -------- CHATBOT --------
 st.header("Ask F1 Questions")
-
 prompt = st.text_input("Enter your question:")
 
 if prompt:
@@ -773,44 +841,42 @@ if prompt:
     st.write(modes)
 
     race_results, race_name = get_race_results(parsed.get("year"), parsed.get("race"))
-
     if race_results is not None:
         st.subheader(f"{race_name} ({parsed.get('year')})")
-
-        # ✅ FULL TABLE
         st.dataframe(
             race_results[
                 [
-                    'positionOrder',
-                    'driver_name',
-                    'constructor_name',
-                    'grid',
-                    'laps',
-                    'time',
-                    'fastestLapTime',
-                    'fastestLapSpeed',
-                    'positionText'
+                    'positionOrder','driver_name','constructor_name','grid','laps','time',
+                    'fastestLapTime','fastestLapSpeed','positionText'
                 ]
             ]
         )
 
     # -------- MULTI-EXECUTION --------
     all_facts = []
-    all_display = []
+    all_display_results = pd.DataFrame()
+    all_display_laps = pd.DataFrame()
 
     for mode in modes:
-        if mode == "comparison":
-            facts, display = handle_comparison(parsed, race_results)
-        else:
-            facts, display = extract_facts(parsed, race_results, mode)
-
+        facts, display_results, display_laps = extract_facts(parsed, race_results, race_name, mode)
         all_facts.extend(facts)
-        all_display.extend(display)
+        if not display_results.empty:
+            all_display_results = pd.concat([all_display_results, display_results]).drop_duplicates()
+        if not display_laps.empty:
+            all_display_laps = pd.concat([all_display_laps, display_laps]).drop_duplicates()
 
     # -------- OUTPUT --------
     st.subheader("Facts Used")
     for f in all_facts:
         st.write(f)
+
+    st.subheader("Filtered Tables Used")
+    if not all_display_results.empty:
+        st.write("### Results / Main Table")
+        st.dataframe(all_display_results)
+    if not all_display_laps.empty:
+        st.write("### Other Relevant Tables (Lap Times / Pit Stops / etc.)")
+        st.dataframe(all_display_laps)
 
     st.subheader("Final Answer")
     st.write(answer_from_facts(all_facts, prompt))
