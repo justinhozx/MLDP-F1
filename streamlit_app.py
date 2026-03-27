@@ -603,14 +603,32 @@ def call_llm(prompt, model="llama3:latest"):
 # INTERPRET QUERY (FREE FORM)
 # ==================================================
 def interpret_query(prompt):
-    system_prompt = f"""
-Extract structured info from this F1 query.
+    # Provide the LLM with all CSV schemas to improve reasoning
+    csv_schema = """
+CSV Schemas:
+drivers.csv: driverId, driverRef, number, code, forename, surname, dob, nationality, url
+lap_times.csv: raceId, driverId, lap, position, time, milliseconds
+pit_stops.csv: raceId, driverId, stop, lap, time, duration, milliseconds
+qualifying.csv: qualifyId, raceId, driverId, constructorId, number, position, q1, q2, q3
+races.csv: raceId, year, round, circuitId, name, date, time, url, fp1_date, fp1_time, fp2_date, fp2_time, fp3_date, fp3_time, quali_date, quali_time, sprint_date, sprint_time
+results.csv: resultId, raceId, driverId, constructorId, number, grid, position, positionText, positionOrder, points, laps, time, milliseconds, fastestLap, rank, fastestLapTime, fastestLapSpeed, statusId
+status.csv: statusId, status
+constructors.csv: constructorId, constructorRef, name, nationality, url
+constructor_standings.csv: constructorStandingsId, raceId, constructorId, points, position, positionText, wins
+driver_standings.csv: driverStandingsId, raceId, driverId, points, position, positionText, wins
+"""
 
-Return JSON ONLY with:
+    system_prompt = f"""
+You are an F1 expert AI. Use ONLY the CSV data structures provided. You know exactly what data each CSV contains.
+
+Extract structured info from this F1 query. Return JSON ONLY with:
 - year
 - race
 - drivers (list if multiple)
 - intent_description (what user wants)
+
+CSV reference:
+{csv_schema}
 
 User: {prompt}
 """
@@ -621,7 +639,7 @@ User: {prompt}
         end = output.rfind("}") + 1
         return json.loads(output[start:end])
     except:
-        return {"intent_description": prompt}
+        return {"intent_description": prompt, "drivers": []}
 
 # ==================================================
 # NORMALIZE INTENT
@@ -672,7 +690,10 @@ def get_race_results(year, race_keyword):
 # ==================================================
 def match_driver_csv(name, df):
     name = name.lower()
-    return df[df['driver_name'].str.lower().apply(lambda x: name in x)]
+    # Fuzzy match: take the driver with most letters matching
+    df['match_score'] = df['driver_name'].str.lower().apply(lambda x: sum([c1==c2 for c1,c2 in zip(x,name)]))
+    best_match = df[df['match_score']==df['match_score'].max()]
+    return best_match.drop(columns=['match_score'])
 
 # ==================================================
 # COMPARISON ENGINE
@@ -745,28 +766,29 @@ def extract_facts(parsed, race_results, mode):
         facts.append(f"Winner: {r['driver_name']} ({r['constructor_name']})")
         display.append(r.to_dict())
 
-    # Lap times for specific driver
-    if "drivers" in parsed and race_results is not None:
+    # Lap times and pit stops for specific driver
+    if "drivers" in parsed and race_results is not None and parsed['drivers']:
         driver_name = parsed['drivers'][0]
         d = match_driver_csv(driver_name, race_results)
         if not d.empty:
             driver_id = d.iloc[0]['driverId']
             race_id = d.iloc[0]['raceId']
+
             # lap times
             driver_laps = lap_times[(lap_times['raceId']==race_id)&(lap_times['driverId']==driver_id)]
             if not driver_laps.empty:
                 csv_debug.append('lap_times.csv')
-                # If user wants lap 20 specifically, include it
+                # Check for specific lap
                 if "lap" in parsed['intent_description'].lower():
                     lap_num = [int(s) for s in parsed['intent_description'].split() if s.isdigit()]
                     if lap_num:
                         lap_row = driver_laps[driver_laps['lap']==lap_num[0]]
                         if not lap_row.empty:
                             facts.append(f"Lap {lap_num[0]} time: {lap_row.iloc[0]['time']}")
-                # full average pace
                 avg_time = driver_laps['milliseconds'].mean()
                 facts.append(f"{driver_name}'s average lap time: {avg_time/1000:.3f} s")
                 display.append(driver_laps.to_dict('records'))
+
             # pit stops
             driver_pits = pit_stops[(pit_stops['raceId']==race_id)&(pit_stops['driverId']==driver_id)]
             if not driver_pits.empty:
